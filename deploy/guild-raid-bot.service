@@ -1,0 +1,15 @@
+[Unit]
+Description=Mabinogi raid recruitment Discord bot
+After=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/guild-raid-bot
+ExecStart=%h/guild-raid-bot/.venv/bin/python -u %h/guild-raid-bot/bot.py
+Environment=PYTHONUNBUFFERED=1
+Restart=on-failure
+RestartSec=15
+UMask=0077
+
+[Install]
+WantedBy=default.target

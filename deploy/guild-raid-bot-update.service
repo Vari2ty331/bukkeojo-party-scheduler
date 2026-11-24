@@ -1,0 +1,7 @@
+[Unit]
+Description=Check GitHub for guild raid bot changes
+
+[Service]
+Type=oneshot
+WorkingDirectory=%h/guild-raid-bot
+ExecStart=/usr/bin/bash %h/guild-raid-bot/deploy/update.sh
