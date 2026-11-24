@@ -19,7 +19,8 @@ from dotenv import load_dotenv
 from core.calendar import (ENGLISH_KEYS, KOREAN_WEEKDAYS, KST, RAID_TYPES, raid_label,
                            is_starter_message, recruitment_week_start, due_openings, opening_for_week, local_dt,
                            starter_content, title, legacy_thread_title, week_days,
-                           FOURF_RUN_EMOJIS, FOURF_PREFERENCE_CONTENT)
+                           FOURF_RUN_EMOJIS, FOURF_PREFERENCE_CONTENT, update_glenn_starter,
+                           glenn_announcement_week)
 from core.storage import Storage, merge_rosters, merge_run_preferences
 from core.calendar_image import render_calendar_png
 
@@ -529,6 +530,23 @@ class RaidBot(commands.Bot):
         embed.set_footer(text='개인 시간 제약은 포함하지 않습니다.')
         return embed
 
+    async def edit_glenn_announcement(self, rec, run_count, memo):
+        """Edit only the tracked starter; caller holds op_lock.
+
+        Leave attachments, reactions, deadline, and DB recruitment state alone.
+        Explicitly suppress mentions even when the original post mentions a role.
+        """
+        if rec is None or rec['raid_type'] != 'glenn':
+            raise ValueError('글렌 모집 기록을 확인할 수 없습니다.')
+        thread = await self.fetch_channel(int(rec['thread_id']))
+        message = await thread.fetch_message(int(rec['message_id']))
+        if message.author.id != self.user.id:
+            raise ValueError('봇이 작성한 글렌 모집 글이 아닙니다.')
+        content = update_glenn_starter(message.content, date.fromisoformat(rec['week_start']),
+                                       run_count, memo)
+        if content != message.content:
+            await message.edit(content=content, allowed_mentions=discord.AllowedMentions.none())
+
     async def finish(self, rec, *, recovered=False):
         async with self.op_lock:
             rec = self.store.by_thread(rec['thread_id'])
@@ -697,7 +715,7 @@ async def emojis(interaction: discord.Interaction):
     await interaction.followup.send(text, ephemeral=True)
 
 
-@party.command(name='글렌설정', description='앞으로 생성할 글렌 모집의 릴 횟수와 메모를 확인하거나 변경합니다.')
+@party.command(name='글렌설정', description='글렌 릴 횟수와 메모를 확인하거나 변경합니다. 변경하면 현재 모집 글에도 반영합니다.')
 @app_commands.rename(run_count='횟수', memo='메모', clear_memo='메모초기화')
 @app_commands.describe(run_count='글렌 주간 진행 횟수. 기본 5릴, 생략하면 기존 설정 유지.',
                        memo='추가 입장권 획득처 또는 공지. 생략하면 기존 메모 유지.',
@@ -706,20 +724,43 @@ async def glenn_settings(interaction: discord.Interaction, run_count: int | None
                          memo: str | None = None, clear_memo: bool = False):
     if not await require_organizer(interaction):
         return
+    await interaction.response.defer(ephemeral=True, thinking=True)
     try:
-        changed = run_count is not None or memo is not None or clear_memo
-        if changed:
-            count, text = bot.store.update_glenn_settings(run_count=run_count, memo=memo, clear_memo=clear_memo)
-        else:
-            count, text = bot.store.glenn_settings()
-        status = '설정을 저장했습니다.' if changed else '현재 설정입니다.'
-        await interaction.response.send_message(
-            f'**글렌 모집 설정** — {status}\n횟수: {count}릴\n메모: {text or "없음"}\n'
-            '이 설정은 다음에 생성하는 글렌 모집부터 적용됩니다.',
+        async with bot.op_lock:
+            changed = run_count is not None or memo is not None or clear_memo
+            if changed:
+                count, text = bot.store.update_glenn_settings(run_count=run_count, memo=memo, clear_memo=clear_memo)
+                status = '설정을 저장했습니다.'
+                # Prefer the exact Glenn thread when invoked within it. Outside
+                # a Glenn thread, target the current Wednesday-opening cycle,
+                # NOT the Thursday-reset next-creation target.
+                rec = bot.store.by_thread(interaction.channel_id)
+                if rec is None or rec['raid_type'] != 'glenn':
+                    start = glenn_announcement_week(datetime.now(KST))
+                    rec = bot.store.by_week(start, 'glenn')
+                future = '다음에 생성하는 글렌 모집에도 적용됩니다.'
+                if rec is None:
+                    result = '현재 주간의 글렌 모집 글이 아직 없습니다.\n' + future
+                else:
+                    try:
+                        await bot.edit_glenn_announcement(rec, count, text)
+                        result = (f'현재 글렌 모집 글에도 반영했습니다. (<#{rec["thread_id"]}>)\n'
+                                  + future)
+                    except Exception:
+                        log.exception('Glenn announcement update failed for %s', rec['thread_id'])
+                        result = ('현재 모집 글 수정에 실패했습니다. 저장된 설정은 유지됩니다.\n'
+                                  '글렌 스레드와 모집 글을 확인한 후 같은 설정값으로 명령어를 다시 실행해 주세요.\n'
+                                  + future)
+            else:
+                count, text = bot.store.glenn_settings()
+                status = '현재 설정입니다.'
+                result = '횟수 또는 메모를 변경하면 현재 모집 글에도 반영됩니다.'
+        await interaction.followup.send(
+            f'**글렌 모집 설정** — {status}\n횟수: {count}릴\n메모: {text or "없음"}\n{result}',
             ephemeral=True, allowed_mentions=discord.AllowedMentions.none())
     except ValueError as exc:
-        await interaction.response.send_message(str(exc), ephemeral=True,
-                                                allowed_mentions=discord.AllowedMentions.none())
+        await interaction.followup.send(str(exc), ephemeral=True,
+                                       allowed_mentions=discord.AllowedMentions.none())
 
 
 @party.command(name='생성', description='선택한 던전의 다음 주 파티 모집 스레드를 생성합니다.')

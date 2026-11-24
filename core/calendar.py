@@ -67,13 +67,39 @@ def legacy_thread_title(thursday: date, raid_type: str) -> str:
     return f"{title(thursday, raid_type)} {raid_label(raid_type)} 모집"
 
 
+def glenn_settings_block(run_count: int, memo: str) -> str:
+    return f"\n\n**이번주 글렌 횟수 {run_count}릴**" + (f"\n{memo}" if memo else "")
+
+
+def update_glenn_starter(content: str, thursday: date, run_count: int, memo: str) -> str:
+    """Replace only the weekly Glenn information, keeping the rest of the post.
+
+    Recognizes existing posts from before the run-count feature as well as
+    posts that have already been closed or reopened. Never rewrites an
+    unrecognized message.
+    """
+    final = week_days(thursday)[-1]
+    header = f"**{raid_label('glenn')} 파티 모집 | {thursday:%m/%d} ~ {final:%m/%d}**"
+    instructions = ("\n\n참여 가능한 날의 **요일 이모지**를 모두 눌러 주세요."
+                    "\n시간 제한이 있다면 이 스레드에 댓글로 남겨 주세요."
+                    "\n평일은 저녁, 주말/공휴일은 점심부터 출발")
+    if header not in content.splitlines():
+        raise ValueError("기존 글렌 모집 글의 제목을 확인할 수 없습니다.")
+    prefix, _, after_header = content.partition(header)
+    # The last full instruction block is the actual one, even when the
+    # organizer's previous memo quoted these same instructions.
+    _old_block, marker, suffix = after_header.rpartition(instructions)
+    if not marker:
+        raise ValueError("기존 글렌 모집 글의 형식을 확인할 수 없습니다.")
+    return prefix + header + glenn_settings_block(run_count, memo) + marker + suffix
+
+
 def starter_content(thursday: date, deadline: datetime | None, raid_type: str = "legacy",
                     role_id: int | None = None, *, glenn_runs: int = DEFAULT_GLENN_RUNS,
                     glenn_memo: str = "") -> str:
     final = week_days(thursday)[-1]
     role_mention = f"<@&{role_id}>\n" if role_id else ""
-    glenn_info = (f"\n\n**이번주 글렌 횟수 {glenn_runs}릴**"
-                  + (f"\n{glenn_memo}" if glenn_memo else "")) if raid_type == "glenn" else ""
+    glenn_info = glenn_settings_block(glenn_runs, glenn_memo) if raid_type == "glenn" else ""
     return (
         role_mention + f"**{raid_label(raid_type)} 파티 모집 | {thursday:%m/%d} ~ {final:%m/%d}**"
         + glenn_info
@@ -127,6 +153,18 @@ def opening_for_week(thursday: date, raid_type: str) -> datetime:
         raise ValueError("파티 모집 주간은 목요일에 시작해야 합니다.")
     days_before, hhmm = RECRUITMENT_OPENINGS[raid_type]
     return local_dt(thursday - timedelta(days=days_before), hhmm)
+
+
+def glenn_announcement_week(now: datetime) -> date:
+    """Most recently scheduled Glenn recruitment, not the next creation target.
+
+    The announcement cycle changes on Wednesday at 11:00 KST, so a Thursday
+    game update still edits the announcement for the play week just beginning.
+    This does not change creation, duplicate checks, or the game reset.
+    """
+    upcoming = recruitment_week_start(now)
+    return (upcoming if now >= opening_for_week(upcoming, "glenn")
+            else upcoming - timedelta(days=7))
 
 
 def due_openings(now: datetime):

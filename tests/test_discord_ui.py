@@ -92,6 +92,13 @@ class CommandAppearanceTests(unittest.TestCase):
                                 and n.func.id == 'recruitment_week_start'
                                 for n in ast.walk(fn)), name)
 
+    def test_glenn_settings_always_applies_changes_no_optional_toggle(self):
+        fn = next(n for n in self.tree.body if isinstance(n, ast.AsyncFunctionDef)
+                  and n.name == 'glenn_settings')
+        self.assertEqual([a.arg for a in fn.args.args],
+                         ['interaction', 'run_count', 'memo', 'clear_memo'])
+        self.assertNotIn('현재글반영', ast.unparse(fn))
+
     def test_required_dungeon_is_korean_choice(self):
         self.assertIn("rename(dungeon='던전')", self.source)
         self.assertIn("Choice(name='글렌 베르나', value='glenn')", self.source)
