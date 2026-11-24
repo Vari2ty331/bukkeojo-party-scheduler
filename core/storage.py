@@ -72,6 +72,13 @@ class Storage:
               created_at TEXT NOT NULL,
               PRIMARY KEY (raid_type, week_start)
             );
+            -- A deliberate deletion suppresses only this week's automatic creation.
+            CREATE TABLE IF NOT EXISTS cancelled_weeks (
+              raid_type TEXT NOT NULL,
+              week_start TEXT NOT NULL,
+              cancelled_at TEXT NOT NULL,
+              PRIMARY KEY (raid_type, week_start)
+            );
             CREATE TABLE IF NOT EXISTS final_roster (
               thread_id TEXT NOT NULL,
               day_index INTEGER NOT NULL,
@@ -129,12 +136,13 @@ class Storage:
             (raid_type, start.isoformat())
         ).fetchone()
 
-    def reserve_creation(self, start, raid_type, parent_channel_id, now):
+    def reserve_creation(self, start, raid_type, parent_channel_id, now, *, allow_cancelled=False):
         '''Atomically claim the dungeon/week before making a Discord request.'''
         if raid_type not in ('glenn', '4f'):
             raise ValueError('Unknown dungeon')
         with self.db:
-            if self.by_week(start, raid_type):
+            self.db.execute('BEGIN IMMEDIATE')
+            if self.by_week(start, raid_type) or (not allow_cancelled and self.is_cancelled(start, raid_type)):
                 return False
             cur = self.db.execute('''
                 INSERT OR IGNORE INTO creation_reservations
@@ -150,6 +158,82 @@ class Storage:
                 ''', (raid_type, start.isoformat()))
                 return False
             return cur.rowcount == 1
+
+    def reserve_deleted_thread_replacement(self, start, raid_type, old_thread_id,
+                                           parent_channel_id, now):
+        """Atomically replace a never-finalized, confirmed-missing thread with a creation claim.
+
+        The caller must first verify Discord returned Unknown Channel for the
+        stored thread. Closed or previously reopened rosters are never discarded.
+        """
+        old_thread_id = str(old_thread_id)
+        key = (raid_type, start.isoformat())
+        with self.db:
+            # Acquire the write lock before reading state in case another
+            # process is finalizing or attempting a replacement.
+            self.db.execute('BEGIN IMMEDIATE')
+            rec = self.by_week(start, raid_type)
+            if (rec is None or rec['thread_id'] != old_thread_id
+                    or rec['status'] not in ('open', 'review_needed')
+                    or rec['closed_at'] is not None or rec['reopened_with_snapshot']
+                    or self.db.execute('SELECT 1 FROM final_roster WHERE thread_id=? LIMIT 1',
+                                       (old_thread_id,)).fetchone()):
+                return False
+            job = self.creation_reservation(start, raid_type)
+            if job is not None:
+                # A crash after inserting the old record may have left its own
+                # reservation. Never remove an unrelated or uncertain claim.
+                if job['thread_id'] != old_thread_id or job['message_id'] != rec['message_id']:
+                    return False
+                self.db.execute('DELETE FROM creation_reservations WHERE raid_type=? AND week_start=?', key)
+            self.db.execute('DELETE FROM recruitments WHERE thread_id=?', (old_thread_id,))
+            self.db.execute("""
+                INSERT INTO creation_reservations
+                  (raid_type, week_start, parent_channel_id, created_at)
+                VALUES (?,?,?,?)
+            """, (*key, str(parent_channel_id), now.isoformat()))
+            return True
+
+    def is_cancelled(self, start, raid_type):
+        return self.db.execute(
+            'SELECT 1 FROM cancelled_weeks WHERE raid_type=? AND week_start=?',
+            (raid_type, start.isoformat())
+        ).fetchone() is not None
+
+    def delete_recruitment(self, start, raid_type, now, *, expected_record, expected_reservation):
+        """Remove just one confirmed recruitment and its roster/reservation atomically.
+
+        Caller must have deleted the corresponding Discord thread (or confirmed
+        it is missing). An explicit cancellation prevents the timer from
+        immediately recreating it. New manual creation can clear that marker.
+        """
+        if raid_type not in ('glenn', '4f', 'legacy'):
+            raise ValueError('Unknown dungeon')
+        key = (raid_type, start.isoformat())
+        with self.db:
+            self.db.execute('BEGIN IMMEDIATE')
+            rec = self.by_week(start, raid_type)
+            job = self.creation_reservation(start, raid_type)
+            snapshot = lambda row: dict(row) if row is not None else None
+            if (snapshot(rec) != snapshot(expected_record)
+                    or snapshot(job) != snapshot(expected_reservation)):
+                raise RuntimeError('Recruitment changed during deletion; retry after checking it')
+            if rec is None and job is None:
+                return False
+            if rec is not None and job is not None and (
+                    job['thread_id'] != rec['thread_id']
+                    or job['message_id'] != rec['message_id']):
+                raise RuntimeError('Conflicting creation reservation; inspect before deleting')
+            if rec is not None:
+                self.db.execute('DELETE FROM final_roster WHERE thread_id=?', (rec['thread_id'],))
+                self.db.execute('DELETE FROM recruitments WHERE thread_id=?', (rec['thread_id'],))
+            self.db.execute('DELETE FROM creation_reservations WHERE raid_type=? AND week_start=?', key)
+            self.db.execute("""
+                INSERT INTO cancelled_weeks (raid_type, week_start, cancelled_at)
+                VALUES (?,?,?) ON CONFLICT(raid_type, week_start)
+                DO UPDATE SET cancelled_at=excluded.cancelled_at
+            """, (*key, now.isoformat()))
+            return True
 
     def record_created_thread(self, start, raid_type, thread_id):
         with self.db:
@@ -200,7 +284,10 @@ class Storage:
                 VALUES (?,?,?,?,?,?,?)
             """, (str(thread_id), raid_type, start.isoformat(),
                   (start + timedelta(days=6)).isoformat(), str(message_id),
-                  deadline_at.isoformat(), json.dumps(emoji_ids)))
+                  (deadline_at.isoformat() if deadline_at is not None else ""), json.dumps(emoji_ids)))
+            # Only a successful creation releases the cancellation marker.
+            self.db.execute('DELETE FROM cancelled_weeks WHERE raid_type=? AND week_start=?',
+                            (raid_type, start.isoformat()))
 
     def open_recruitments(self):
         return self.db.execute(
@@ -231,7 +318,7 @@ class Storage:
                    reopened_with_snapshot=1, reactions_cleared=0,
                    deadline_at=?, emoji_ids_json=?
                 WHERE thread_id=? AND status='closed'
-            """, (deadline_at.isoformat(), json.dumps(emoji_ids), str(thread_id)))
+            """, ((deadline_at.isoformat() if deadline_at is not None else ""), json.dumps(emoji_ids), str(thread_id)))
             if cur.rowcount != 1:
                 raise RuntimeError('Reopen state transition failed')
 
@@ -241,7 +328,7 @@ class Storage:
             cur = self.db.execute("""
                 UPDATE recruitments SET deadline_at=?
                 WHERE thread_id=? AND status='open' AND reopened_with_snapshot=1
-            """, (deadline_at.isoformat(), str(thread_id)))
+            """, ((deadline_at.isoformat() if deadline_at is not None else ""), str(thread_id)))
             if cur.rowcount != 1:
                 raise ValueError('The recruitment is not currently reopened')
 

@@ -11,6 +11,9 @@ RAID_LABELS = {
     "legacy": "기존 파티",  # Recruitment records made with the previous single-raid bot.
 }
 RAID_TYPES = ("glenn", "4f")
+# Number of days before the Thursday raid week, and local opening time.
+RECRUITMENT_OPENINGS = {"4f": (3, "11:00"), "glenn": (1, "11:00")}
+WEEKLY_RESET_TIME = time(7, 0)  # Thursday 07:00 KST
 
 
 def raid_label(raid_type: str) -> str:
@@ -26,6 +29,20 @@ def next_thursday(today: date) -> date:
     return today + timedelta(days=days or 7)
 
 
+def recruitment_week_start(now: datetime) -> date:
+    """Target Thursday for creation, rolling forward at Thursday 07:00 KST.
+
+    Before the reset on Thursday morning, the recruitment still targets that
+    same Thursday. After the reset, it targets the following Thursday.
+    """
+    if now.tzinfo is None or now.utcoffset() is None:
+        raise ValueError("Timezone-aware datetime required")
+    local = now.astimezone(KST)
+    if local.weekday() == 3 and local.time() < WEEKLY_RESET_TIME:
+        return local.date()
+    return next_thursday(local.date())
+
+
 def week_days(thursday: date):
     if thursday.weekday() != 3:
         raise ValueError("파티 모집 주간은 목요일에 시작해야 합니다.")
@@ -37,7 +54,7 @@ def title(thursday: date, raid_type: str = "legacy") -> str:
     return f"{thursday:%m.%d} ~ {final:%m.%d} {raid_label(raid_type)} 모집"
 
 
-def starter_content(thursday: date, deadline: datetime, raid_type: str = "legacy",
+def starter_content(thursday: date, deadline: datetime | None, raid_type: str = "legacy",
                     role_id: int | None = None) -> str:
     items = [f"{day:%m/%d}({label})" for day, label in zip(week_days(thursday), KOREAN_WEEKDAYS)]
     role_mention = f"<@&{role_id}>\n" if role_id else ""
@@ -46,7 +63,8 @@ def starter_content(thursday: date, deadline: datetime, raid_type: str = "legacy
         + " · ".join(items)
         + "\n\n참여 가능한 날의 **요일 이모지**를 모두 눌러 주세요."
         + "\n시간 제한이 있다면 이 스레드에 댓글로 남겨 주세요."
-        + f"\n⏰ 신청 마감: **{deadline.astimezone(KST):%m/%d %H:%M} (한국 시간)**"
+        + (f"\n⏰ 신청 마감: **{deadline.astimezone(KST):%m/%d %H:%M} (한국 시간)**"
+           if deadline is not None else "\n신청 마감: 운영진이 직접 마감합니다.")
     )
 
 
@@ -78,3 +96,23 @@ def schedule_for_week(thursday: date, open_days_before: int, open_at: str,
     if not opening < closing:
         raise ValueError("모집 시작 시간은 마감 시간보다 빨라야 합니다.")
     return opening, closing
+
+
+def opening_for_week(thursday: date, raid_type: str) -> datetime:
+    """4F opens Monday 11:00 KST; Glenn opens Wednesday 11:00 KST."""
+    if thursday.weekday() != 3:
+        raise ValueError("파티 모집 주간은 목요일에 시작해야 합니다.")
+    days_before, hhmm = RECRUITMENT_OPENINGS[raid_type]
+    return local_dt(thursday - timedelta(days=days_before), hhmm)
+
+
+def due_openings(now: datetime):
+    """Eligible dungeon/week pairs; catch up until Thursday 07:00 KST.
+
+    Storage separately prevents a second creation for the same dungeon/week.
+    The opening window is not a recruitment deadline.
+    """
+    now = now.astimezone(KST)
+    start = recruitment_week_start(now)
+    return [(start, raid_type) for raid_type in RAID_TYPES
+            if now >= opening_for_week(start, raid_type)]

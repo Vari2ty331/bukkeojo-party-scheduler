@@ -17,7 +17,7 @@ from discord.ext import commands, tasks
 from dotenv import load_dotenv
 
 from core.calendar import (ENGLISH_KEYS, KOREAN_WEEKDAYS, KST, RAID_TYPES, raid_label,
-                           is_starter_message, next_thursday, schedule_for_week,
+                           is_starter_message, recruitment_week_start, due_openings, opening_for_week, local_dt,
                            starter_content, title, week_days)
 from core.storage import Storage, merge_rosters
 
@@ -40,9 +40,7 @@ ORGANIZER_ROLE_ID = env_int('ORGANIZER_ROLE_ID')
 ROLE_MENTIONS_ENABLED = os.getenv('ROLE_MENTIONS_ENABLED', 'false').strip().lower() == 'true'
 AUTO_CREATE = os.getenv('AUTO_CREATE_ENABLED', 'false').lower() == 'true'
 AUTO_CLOSE = os.getenv('AUTO_CLOSE_ENABLED', 'false').lower() == 'true'
-OPEN_DAYS_BEFORE = env_int('OPEN_DAYS_BEFORE', 1)
 CLOSE_DAYS_BEFORE = env_int('CLOSE_DAYS_BEFORE', 1)
-OPEN_TIME = os.getenv('OPEN_TIME', '18:00')
 CLOSE_TIME = os.getenv('CLOSE_TIME', '23:00')
 DB_PATH = ROOT / os.getenv('DATABASE_PATH', 'data/recruitments.sqlite3')
 
@@ -53,6 +51,16 @@ if ROLE_MENTIONS_ENABLED and not all((GLENN_PARTICIPANT_ROLE_ID, FOURF_PARTICIPA
 
 party = app_commands.Group(name='파티', description='주간 파티 모집을 관리합니다.')
 REOPEN_NOTE = '\n\n🔓 재모집 중 — 기존 신청자는 다시 누르지 않아도 됩니다.'
+
+
+def configured_deadline(start: date, raid_type: str) -> datetime | None:
+    # The two opening schedules do not depend on whether automatic closing is enabled.
+    if not AUTO_CLOSE:
+        return None
+    deadline = local_dt(start - timedelta(days=CLOSE_DAYS_BEFORE), CLOSE_TIME)
+    if deadline <= opening_for_week(start, raid_type):
+        raise ValueError('자동 마감 시각은 모집 시작 시각보다 늦어야 합니다.')
+    return deadline
 
 
 def participant_role_id(raid_type: str) -> int:
@@ -117,7 +125,7 @@ class RaidBot(commands.Bot):
         return [emoji_by_name.get(f'party_{day}') or emoji_by_name[f'raid_{day}']
                 for day in ENGLISH_KEYS]
 
-    async def find_unrecorded_thread(self, parent, start, raid_type):
+    async def find_unrecorded_thread(self, parent, start, raid_type, *, archive_limit=100):
         '''Recover a thread created before the bot crashed while saving its ID.
 
         Never adopt a thread owned by a person or another application.
@@ -128,7 +136,7 @@ class RaidBot(commands.Bot):
             if (thread.parent_id == parent.id and thread.name == expected
                     and thread.owner_id == self.user.id):
                 candidates.append(thread)
-        async for thread in parent.archived_threads(limit=100):
+        async for thread in parent.archived_threads(limit=archive_limit):
             if (thread.name == expected and thread.owner_id == self.user.id
                     and thread.id not in {x.id for x in candidates}):
                 candidates.append(thread)
@@ -153,28 +161,42 @@ class RaidBot(commands.Bot):
                 '모든 역할 멘션 권한을 부여해 주세요.')
         return role
 
-    async def create_recruitment(self, start: date, raid_type: str):
+    async def create_recruitment(self, start: date, raid_type: str, *, allow_deleted_replacement=False):
         if raid_type not in RAID_TYPES:
             raise ValueError(f'지원하지 않는 던전입니다: {raid_type}')
         async with self.op_lock:
+            if not allow_deleted_replacement and self.store.is_cancelled(start, raid_type):
+                return None, False
             existing = self.store.by_week(start, raid_type)
+            missing_thread_id = None
             if existing:
-                # Repeat create requests repair interrupted reaction seeding,
-                # but never create a second thread, including after closing.
-                if existing['status'] == 'open':
-                    try:
-                        channel = await self.fetch_channel(int(existing['thread_id']))
-                        message = await channel.fetch_message(int(existing['message_id']))
+                # Fetch the thread itself, separately from its starter message.
+                # A deleted message or API permission/network error is NOT proof
+                # that the recruitment thread was deleted.
+                try:
+                    channel = await self.fetch_channel(int(existing['thread_id']))
+                except discord.NotFound as exc:
+                    if exc.code != 10003:  # Unknown Channel
+                        raise
+                    if not allow_deleted_replacement:
+                        raise RuntimeError('기존 모집 스레드가 없습니다. 운영진이 직접 /파티 생성으로 확인해 주세요.') from exc
+                    if (existing['status'] not in ('open', 'review_needed')
+                            or existing['closed_at'] is not None or existing['reopened_with_snapshot']):
+                        raise RuntimeError('기존 모집 스레드가 삭제되었지만 마감 또는 재개 기록이 있어 보존합니다. 운영진 확인이 필요합니다.') from exc
+                    missing_thread_id = existing['thread_id']
+                else:
+                    if existing['status'] == 'open':
+                        try:
+                            message = await channel.fetch_message(int(existing['message_id']))
+                        except discord.NotFound as exc:
+                            raise RuntimeError('기존 모집 스레드는 있지만 모집 메시지를 찾을 수 없습니다. 운영진 확인이 필요합니다.') from exc
                         for emoji in await self.get_emojis():
                             if not any(getattr(r.emoji, 'id', None) == emoji.id for r in message.reactions):
                                 await message.add_reaction(emoji)
-                    except discord.HTTPException:
-                        log.exception('Unable to repair reactions for %s', start)
-                return existing, False
+                    return existing, False
 
             emojis = await self.get_emojis()  # fail BEFORE trying to create
-            opening, deadline = schedule_for_week(
-                start, OPEN_DAYS_BEFORE, OPEN_TIME, CLOSE_DAYS_BEFORE, CLOSE_TIME)
+            deadline = configured_deadline(start, raid_type)
             default_parent_id = GLENN_TEXT_CHANNEL_ID if raid_type == 'glenn' else FOURF_TEXT_CHANNEL_ID
             job = self.store.creation_reservation(start, raid_type)
             parent_id = int(job['parent_channel_id']) if job else default_parent_id
@@ -184,8 +206,20 @@ class RaidBot(commands.Bot):
             mention_role = self.ping_target_for(parent, raid_type) if ROLE_MENTIONS_ENABLED else None
 
             claimed = False
-            if job is None:
-                claimed = self.store.reserve_creation(start, raid_type, parent.id, datetime.now(KST))
+            if missing_thread_id is not None:
+                # Preflight (emojis, parent channel, role permissions) succeeded.
+                # Atomically remove the stale record and claim the replacement.
+                claimed = self.store.reserve_deleted_thread_replacement(
+                    start, raid_type, missing_thread_id, parent.id, datetime.now(KST))
+                if not claimed:
+                    raise RuntimeError('기존 모집 기록 또는 생성 예약이 변경되었거나 저장된 명단이 있습니다. 기존 기록을 보존합니다.')
+                log.info('Replacing deleted recruitment thread %s for %s %s',
+                         missing_thread_id, raid_type, start)
+                job = self.store.creation_reservation(start, raid_type)
+            elif job is None:
+                claimed = self.store.reserve_creation(
+                    start, raid_type, parent.id, datetime.now(KST),
+                    allow_cancelled=allow_deleted_replacement)
                 job = self.store.creation_reservation(start, raid_type)
             if not job:
                 # A second process may have committed its record meanwhile.
@@ -250,6 +284,77 @@ class RaidBot(commands.Bot):
                     await message.add_reaction(emoji)
             return self.store.by_thread(thread.id), True
 
+    async def delete_party(self, start, raid_type, *, invoking_channel_id, expected_thread_id=None):
+        """Delete a confirmed bot-managed thread before removing the DB records.
+
+        Recovery from the configured parent is allowed for a missing thread or
+        interrupted creation. Existing recorded threads must be deleted from
+        inside the thread, to reduce the risk of selecting the wrong party.
+        """
+        async with self.op_lock:
+            rec = self.store.by_week(start, raid_type)
+            job = self.store.creation_reservation(start, raid_type)
+            if rec is None and job is None:
+                return False
+            if expected_thread_id is not None and (
+                    rec is None or rec['thread_id'] != str(expected_thread_id)):
+                raise RuntimeError('모집 정보가 변경되었습니다. 다시 확인해 주세요.')
+            if rec is not None and job is not None and (
+                    job['thread_id'] != rec['thread_id']
+                    or job['message_id'] != rec['message_id']):
+                raise RuntimeError('모집 기록과 생성 예약이 일치하지 않습니다. 운영진 확인이 필요합니다.')
+
+            thread_id = rec['thread_id'] if rec is not None else job['thread_id']
+            parent_id = (int(job['parent_channel_id']) if job is not None else
+                         (GLENN_TEXT_CHANNEL_ID if raid_type == 'glenn' else FOURF_TEXT_CHANNEL_ID))
+            if expected_thread_id is None and invoking_channel_id != parent_id:
+                raise RuntimeError('해당 던전의 모집 채널에서 사용해 주세요.')
+            thread = None
+            if thread_id is not None:
+                try:
+                    thread = await self.fetch_channel(int(thread_id))
+                except discord.NotFound as exc:
+                    if exc.code != 10003:  # Only a confirmed missing channel is safe to clear.
+                        raise
+            else:
+                # A failed Discord create might have succeeded before its ID
+                # could be saved. Inspect active and all visible public archived
+                # threads before releasing this reservation.
+                parent = await self.fetch_channel(parent_id)
+                if not isinstance(parent, discord.TextChannel) or parent.guild.id != GUILD_ID:
+                    raise RuntimeError('기존 모집 채널을 확인할 수 없습니다.')
+                candidate = await self.find_unrecorded_thread(parent, start, raid_type, archive_limit=None)
+                if candidate is not None:
+                    # A title alone cannot prove the candidate is the intended
+                    # thread (old years can have matching month/day titles).
+                    # Do not destroy anything based on this uncertain match.
+                    raise RuntimeError(
+                        f'일치하는 스레드(<#{candidate.id}>)가 발견되었습니다. '
+                        '스레드와 생성 기록을 확인한 후 다시 시도해 주세요.')
+
+            if thread is not None:
+                if (not isinstance(thread, discord.Thread) or thread.guild.id != GUILD_ID
+                        or thread.owner_id != self.user.id):
+                    raise RuntimeError('봇이 생성한 모집 스레드인지 확인할 수 없어 삭제하지 않습니다.')
+                if expected_thread_id is None and thread.parent_id != parent_id:
+                    raise RuntimeError('모집 스레드의 상위 채널이 일치하지 않습니다.')
+                if rec is not None and expected_thread_id is None:
+                    raise RuntimeError(f'모집 스레드가 아직 존재합니다. <#{thread.id}> 안에서 /파티 삭제를 사용해 주세요.')
+                try:
+                    await thread.delete(reason=f'Organizer confirmed party deletion: {raid_type} {start}')
+                except discord.NotFound as exc:
+                    if exc.code != 10003:
+                        raise
+
+            # Never remove the DB record if Discord deletion/verification failed.
+            # The DB transaction also clears saved rosters and creation claims.
+            deleted = self.store.delete_recruitment(
+                start, raid_type, datetime.now(KST),
+                expected_record=rec, expected_reservation=job)
+            if deleted:
+                log.info('Organizer deleted recruitment %s %s (thread %s)', raid_type, start, thread_id)
+            return deleted
+
     async def live_roster(self, rec):
         channel = await self.fetch_channel(int(rec['thread_id']))
         message = await channel.fetch_message(int(rec['message_id']))
@@ -291,6 +396,8 @@ class RaidBot(commands.Bot):
     async def finish(self, rec, *, recovered=False):
         async with self.op_lock:
             rec = self.store.by_thread(rec['thread_id'])
+            if rec is None:
+                raise ValueError('이미 삭제된 모집입니다.')
             if rec['status'] != 'closed':
                 roster = await self.live_roster(rec)
                 self.store.finalize(rec['thread_id'], roster, datetime.now(KST))
@@ -312,9 +419,9 @@ class RaidBot(commands.Bot):
     async def reopen_recruitment(self, thread_id, *, extra_minutes=None):
         """Restore weekday reactions while preserving the closed signup snapshot.
 
-        An early reopen uses the original deadline. If the deadline has passed,
-        an organizer must provide an explicit extension to avoid an immediate
-        automatic re-close. This is safe to retry if a Discord edit fails.
+        Manual-only recruitment reopens without a deadline. When automatic
+        closing is enabled, an expired deadline needs an explicit extension.
+        This is safe to retry if a Discord edit fails.
         """
         async with self.op_lock:
             rec = self.store.by_thread(thread_id)
@@ -329,12 +436,16 @@ class RaidBot(commands.Bot):
             if rec['status'] == 'open' and not rec['reopened_with_snapshot']:
                 return rec, False
             now = datetime.now(KST)
-            deadline = datetime.fromisoformat(rec['deadline_at'])
+            deadline = (datetime.fromisoformat(rec['deadline_at'])
+                        if AUTO_CLOSE and rec['deadline_at'] else None)
             if extra_minutes is not None:
+                if not AUTO_CLOSE:
+                    raise ValueError('자동 마감이 꺼져 있습니다. 연장시간 없이 /파티 재개를 사용해 주세요.')
                 if not 1 <= extra_minutes <= 10080:
                     raise ValueError('연장 시간은 1~10080분 사이로 입력해 주세요.')
-                deadline = max(deadline, now + timedelta(minutes=extra_minutes))
-            if deadline <= now:
+                extension = now + timedelta(minutes=extra_minutes)
+                deadline = max(deadline, extension) if deadline else extension
+            if deadline is not None and deadline <= now:
                 raise ValueError('기존 마감 시간이 지났습니다. /파티 재개 연장시간:120처럼 연장 시간을 입력해 주세요.')
 
             channel = await self.fetch_channel(int(rec['thread_id']))
@@ -357,7 +468,7 @@ class RaidBot(commands.Bot):
                 for emoji in emojis:
                     if not any(getattr(r.emoji, 'id', None) == emoji.id for r in message.reactions):
                         await message.add_reaction(emoji)
-                if extra_minutes is not None:
+                if extra_minutes is not None or not AUTO_CLOSE:
                     self.store.extend_reopened_deadline(thread_id, deadline)
                 just_reopened = False
 
@@ -376,24 +487,23 @@ class RaidBot(commands.Bot):
     async def check_deadlines(self):
         now = datetime.now(KST)
         if AUTO_CREATE:
-            start = next_thursday(now.date())
-            try:
-                opening, closing = schedule_for_week(start, OPEN_DAYS_BEFORE, OPEN_TIME,
-                                                     CLOSE_DAYS_BEFORE, CLOSE_TIME)
-                if opening <= now < closing:
-                    for raid_type in RAID_TYPES:
-                        try:
-                            if self.store.by_week(start, raid_type) is None:
-                                rec, created = await self.create_recruitment(start, raid_type)
-                                if created:
-                                    log.info('Automatically created %s recruitment: thread %s',
-                                             raid_type, rec['thread_id'])
-                        except Exception:
-                            log.exception('Automatic creation failed for %s', raid_type)
-            except Exception:
-                log.exception('Automatic thread creation failed')
+            for start, raid_type in due_openings(now):
+                try:
+                    deadline = configured_deadline(start, raid_type)
+                    if deadline is not None and now >= deadline:
+                        continue
+                    if (self.store.by_week(start, raid_type) is None
+                            and not self.store.is_cancelled(start, raid_type)):
+                        rec, created = await self.create_recruitment(start, raid_type)
+                        if created:
+                            log.info('Automatically created %s recruitment: thread %s',
+                                     raid_type, rec['thread_id'])
+                except Exception:
+                    log.exception('Automatic creation failed for %s', raid_type)
         if AUTO_CLOSE:
             for rec in self.store.open_recruitments():
+                if not rec['deadline_at']:
+                    continue  # recruitment created without an automatic deadline
                 deadline = datetime.fromisoformat(rec['deadline_at'])
                 if now < deadline:
                     continue
@@ -447,9 +557,9 @@ async def create(interaction: discord.Interaction, dungeon: str):
     if not await require_organizer(interaction):
         return
     await interaction.response.defer(ephemeral=True, thinking=True)
-    start = next_thursday(datetime.now(KST).date())
+    start = recruitment_week_start(datetime.now(KST))
     try:
-        rec, created = await bot.create_recruitment(start, dungeon)
+        rec, created = await bot.create_recruitment(start, dungeon, allow_deleted_replacement=True)
         verb = '새 모집 스레드를 생성했습니다.' if created else '이미 모집 스레드가 있습니다. 기존 스레드를 안내합니다.'
         await interaction.followup.send(
             f'**{raid_label(dungeon)}** — {verb}\n'
@@ -459,6 +569,77 @@ async def create(interaction: discord.Interaction, dungeon: str):
         log.exception('Manual create failed for %s', dungeon)
         await interaction.followup.send(
             f'**{raid_label(dungeon)}** 파티 모집을 생성하지 못했습니다: {exc}', ephemeral=True)
+
+
+@party.command(name='삭제', description='모집 스레드와 해당 주의 신청 기록을 삭제합니다.')
+@app_commands.rename(confirmed='확인', dungeon='던전', week='시작일')
+@app_commands.describe(confirmed='정말 삭제하려면 참(True)을 선택해 주세요.',
+                       dungeon='스레드가 이미 삭제된 경우 모집 채널에서 선택해 주세요.',
+                       week='모집 주간의 목요일 날짜(YYYY-MM-DD). 생략하면 다음 모집 주간입니다.')
+@app_commands.choices(dungeon=[
+    app_commands.Choice(name='글렌 베르나', value='glenn'),
+    app_commands.Choice(name='4관', value='4f'),
+])
+async def delete(interaction: discord.Interaction, confirmed: bool = False,
+                 dungeon: str | None = None, week: str | None = None):
+    if not await require_organizer(interaction):
+        return
+    rec = bot.store.by_thread(interaction.channel_id)
+    if rec is not None:
+        if dungeon is not None or week is not None:
+            await interaction.response.send_message(
+                '모집 스레드 안에서는 던전과 시작일을 입력하지 않아도 됩니다.', ephemeral=True)
+            return
+        start, raid_type = date.fromisoformat(rec['week_start']), rec['raid_type']
+        expected_thread_id = rec['thread_id']
+    else:
+        if dungeon not in RAID_TYPES or interaction.channel_id not in (GLENN_TEXT_CHANNEL_ID, FOURF_TEXT_CHANNEL_ID):
+            await interaction.response.send_message(
+                '모집 스레드 안에서 사용하거나, 스레드가 이미 삭제되었다면 해당 모집 채널에서 던전을 선택해 주세요.',
+                ephemeral=True)
+            return
+        try:
+            start = date.fromisoformat(week) if week else recruitment_week_start(datetime.now(KST))
+            if start.weekday() != 3:
+                raise ValueError('Not Thursday')
+        except ValueError:
+            await interaction.response.send_message('시작일은 목요일 날짜(YYYY-MM-DD)로 입력해 주세요.', ephemeral=True)
+            return
+        raid_type = dungeon
+        expected_thread_id = None
+        job = bot.store.creation_reservation(start, raid_type)
+        parent_id = int(job['parent_channel_id']) if job else (
+            GLENN_TEXT_CHANNEL_ID if raid_type == 'glenn' else FOURF_TEXT_CHANNEL_ID)
+        if interaction.channel_id != parent_id:
+            await interaction.response.send_message('해당 던전의 모집 채널에서 사용해 주세요.', ephemeral=True)
+            return
+        if bot.store.by_week(start, raid_type) is None and job is None:
+            await interaction.response.send_message('해당 주간의 모집 기록이나 생성 예약이 없습니다.', ephemeral=True)
+            return
+
+    label = f'{raid_label(raid_type)} | {start:%Y/%m/%d} ~ {(start + timedelta(days=6)):%m/%d}'
+    if not confirmed:
+        await interaction.response.send_message(
+            f'**{label}**\n⚠️ 모집 스레드(있는 경우), 모든 신청 명단 및 해당 생성 기록을 영구 삭제합니다. '
+            '복구할 수 없으며 자동 재생성되지 않습니다.\n'
+            '삭제하려면 같은 명령어에서 확인을 참(True)으로 선택해 주세요.', ephemeral=True)
+        return
+    await interaction.response.defer(ephemeral=True, thinking=True)
+    try:
+        removed = await bot.delete_party(start, raid_type, invoking_channel_id=interaction.channel_id,
+                                         expected_thread_id=expected_thread_id)
+    except Exception as exc:
+        log.exception('Party deletion failed for %s %s', raid_type, start)
+        await interaction.followup.send(f'삭제 실패: {exc}', ephemeral=True)
+        return
+    try:
+        await interaction.followup.send(
+            f'**{label}** — 모집을 삭제했습니다. /파티 생성으로 다시 만들 수 있습니다.'
+            if removed else '이미 삭제되었거나 해당 모집 기록이 없습니다.', ephemeral=True)
+    except discord.HTTPException:
+        # The interaction's channel itself may now be gone. Deletion has already
+        # committed; do not report a false failure or try to recreate anything.
+        log.info('Deletion result could not be sent after thread deletion: %s', label)
 
 
 @party.command(name='명단', description='현재 스레드의 요일별 신청자 명단을 보여 줍니다.')
@@ -480,7 +661,7 @@ async def report(interaction: discord.Interaction):
 
 @party.command(name='재개', description='현재 스레드의 모집을 다시 열고 기존 신청자를 유지합니다.')
 @app_commands.rename(extra_minutes='연장시간')
-@app_commands.describe(extra_minutes='마감 시각이 지난 경우 현재부터 추가로 모집할 시간(분). 선택 사항')
+@app_commands.describe(extra_minutes='자동 마감 사용 시에만 필요한 연장 시간(분). 선택 사항')
 async def reopen(interaction: discord.Interaction, extra_minutes: int | None = None):
     if not await require_organizer(interaction):
         return

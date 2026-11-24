@@ -26,7 +26,7 @@ class CommandAppearanceTests(unittest.TestCase):
         self.assertIn('if ROLE_MENTIONS_ENABLED and not all', self.source)
 
     def test_korean_subcommands(self):
-        expected = {'상태', '이모지', '생성', '명단', '마감', '재개'}
+        expected = {'상태', '이모지', '생성', '명단', '마감', '재개', '삭제'}
         actual = set()
         for node in ast.walk(self.tree):
             if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
@@ -39,6 +39,14 @@ class CommandAppearanceTests(unittest.TestCase):
                              if k.arg == 'name' and isinstance(k.value, ast.Constant)]
                     actual.update(names)
         self.assertEqual(actual, expected)
+
+    def test_manual_create_and_default_delete_share_week_boundary(self):
+        functions = {n.name: n for n in self.tree.body if isinstance(n, ast.AsyncFunctionDef)}
+        for name in ('create', 'delete'):
+            fn = functions[name]
+            self.assertTrue(any(isinstance(n, ast.Call) and isinstance(n.func, ast.Name)
+                                and n.func.id == 'recruitment_week_start'
+                                for n in ast.walk(fn)), name)
 
     def test_required_dungeon_is_korean_choice(self):
         self.assertIn("rename(dungeon='던전')", self.source)

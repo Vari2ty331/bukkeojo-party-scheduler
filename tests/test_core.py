@@ -2,11 +2,12 @@ import json
 import sqlite3
 import tempfile
 import unittest
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
 from core.calendar import (KST, is_starter_message, next_thursday, raid_label,
-                           schedule_for_week, starter_content, title, week_days)
+                           schedule_for_week, starter_content, title, week_days,
+                           opening_for_week, due_openings, recruitment_week_start)
 from core.storage import Storage, merge_rosters
 
 
@@ -25,10 +26,57 @@ class CalendarTests(unittest.TestCase):
         self.assertEqual(next_thursday(date(2026, 11, 24)), START)
         self.assertEqual(next_thursday(START), date(2026, 12, 3))
 
+    def test_recruitment_week_rolls_over_at_seven_kst(self):
+        following = date(2026, 12, 3)
+        cases = [
+            (datetime(2026, 11, 25, 23, 59, tzinfo=KST), START),
+            (datetime(2026, 11, 26, 0, tzinfo=KST), START),
+            (datetime(2026, 11, 26, 6, 59, 59, 999999, tzinfo=KST), START),
+            (datetime(2026, 11, 26, 7, tzinfo=KST), following),
+            (datetime(2026, 11, 26, 7, 0, 1, tzinfo=KST), following),
+            (datetime(2026, 11, 27, 12, tzinfo=KST), following),
+            (datetime(2026, 12, 3, 6, 59, tzinfo=KST), following),
+            (datetime(2026, 12, 3, 7, tzinfo=KST), date(2026, 12, 10)),
+            (datetime(2026, 12, 31, 7, tzinfo=KST), date(2027, 1, 7)),
+        ]
+        for now, expected in cases:
+            with self.subTest(now=now):
+                self.assertEqual(recruitment_week_start(now), expected)
+
+    def test_recruitment_week_is_independent_of_server_timezone(self):
+        self.assertEqual(recruitment_week_start(datetime(2026, 11, 25, 21, 59, tzinfo=timezone.utc)), START)
+        self.assertEqual(recruitment_week_start(datetime(2026, 11, 25, 22, tzinfo=timezone.utc)), date(2026, 12, 3))
+        with self.assertRaises(ValueError):
+            recruitment_week_start(datetime(2026, 11, 26, 7))
+
     def test_schedule(self):
         op, cl = schedule_for_week(START, 1, '18:00', 1, '23:00')
         self.assertEqual(op, datetime(2026, 11, 25, 18, tzinfo=KST))
         self.assertEqual(cl, DEADLINE)
+
+    def test_independent_openings(self):
+        self.assertEqual(opening_for_week(START, '4f'), datetime(2026, 11, 23, 11, tzinfo=KST))
+        self.assertEqual(opening_for_week(START, 'glenn'), datetime(2026, 11, 25, 11, tzinfo=KST))
+        cases = [
+            (datetime(2026, 11, 23, 10, 59, tzinfo=KST), []),
+            (datetime(2026, 11, 23, 11, tzinfo=KST), [(START, '4f')]),
+            (datetime(2026, 11, 25, 10, 59, tzinfo=KST), [(START, '4f')]),
+            (datetime(2026, 11, 25, 11, tzinfo=KST), [(START, 'glenn'), (START, '4f')]),
+            (datetime(2026, 11, 25, 23, 59, tzinfo=KST), [(START, 'glenn'), (START, '4f')]),
+            (datetime(2026, 11, 26, 0, tzinfo=KST), [(START, 'glenn'), (START, '4f')]),
+            (datetime(2026, 11, 26, 6, 59, tzinfo=KST), [(START, 'glenn'), (START, '4f')]),
+            (datetime(2026, 11, 26, 7, tzinfo=KST), []),
+            (datetime(2026, 11, 30, 11, tzinfo=KST), [(date(2026, 12, 3), '4f')]),
+        ]
+        for now, expected in cases:
+            with self.subTest(now=now):
+                self.assertEqual(due_openings(now), expected)
+
+    def test_manual_only_starter(self):
+        text = starter_content(START, None, '4f')
+        self.assertIn('신청 마감: 운영진이 직접 마감합니다.', text)
+        self.assertNotIn('⏰', text)
+        self.assertTrue(is_starter_message(text, START, '4f'))
 
     def test_starter_mentions_only_configured_role_when_supplied(self):
         glenn = starter_content(START, DEADLINE, 'glenn', role_id=111222333)
@@ -69,6 +117,21 @@ class CalendarTests(unittest.TestCase):
 
 
 class StorageTests(unittest.TestCase):
+    def test_manual_only_recruitment_and_reopen(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / 'test.sqlite3'
+            db = Storage(path)
+            db.insert('100', START, '101', None, EMOJIS, '4f')
+            self.assertEqual(db.by_thread('100')['deadline_at'], '')
+            db.finalize('100', {0: [('123', 'Alice')]}, DEADLINE)
+            db.reopen('100', None, EMOJIS)
+            self.assertEqual(db.by_thread('100')['deadline_at'], '')
+            self.assertEqual(db.by_thread('100')['status'], 'open')
+            self.assertEqual(db.final_roster('100')[0], [('123', 'Alice')])
+            db.extend_reopened_deadline('100', None)
+            self.assertEqual(db.by_thread('100')['deadline_at'], '')
+            db.db.close()
+
     def test_two_recruitments_same_week_are_independent(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / 'test.sqlite3'
@@ -207,6 +270,135 @@ class StorageTests(unittest.TestCase):
             self.assertIsNotNone(resumed.creation_reservation(START, '4f'))
             self.assertFalse(resumed.reserve_creation(START, 'glenn', 999, DEADLINE))
             resumed.db.close()
+
+    def test_deleted_open_thread_replacement_is_atomic_and_dungeon_specific(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / 'test.sqlite3'
+            db = Storage(path)
+            db.insert('100', START, '101', DEADLINE, EMOJIS, 'glenn')
+            db.insert('200', START, '201', DEADLINE, EMOJIS, '4f')
+            self.assertFalse(db.reserve_deleted_thread_replacement(START, 'glenn', '999', '500', DEADLINE))
+            self.assertTrue(db.reserve_deleted_thread_replacement(START, 'glenn', '100', '500', DEADLINE))
+            self.assertIsNone(db.by_thread('100'))
+            self.assertEqual(db.by_thread('200')['status'], 'open')
+            self.assertFalse(db.reserve_creation(START, 'glenn', '500', DEADLINE))
+            db.db.close()
+            db = Storage(path)
+            self.assertIsNotNone(db.creation_reservation(START, 'glenn'))
+            db.record_created_thread(START, 'glenn', '300')
+            db.record_recruitment_message(START, 'glenn', '301')
+            db.insert('300', START, '301', DEADLINE, EMOJIS, 'glenn')
+            db.release_creation_reservation(START, 'glenn')
+            self.assertEqual(db.by_week(START, 'glenn')['thread_id'], '300')
+            db.db.close()
+
+    def test_deleted_thread_replacement_preserves_closed_and_reopened_history(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db = Storage(Path(tmp) / 'test.sqlite3')
+            db.insert('100', START, '101', DEADLINE, EMOJIS, 'glenn')
+            db.finalize('100', {0: [('7', 'Player')]}, DEADLINE)
+            self.assertFalse(db.reserve_deleted_thread_replacement(START, 'glenn', '100', '500', DEADLINE))
+            db.mark_reactions_cleared('100')
+            db.reopen('100', DEADLINE + timedelta(hours=2), EMOJIS)
+            self.assertFalse(db.reserve_deleted_thread_replacement(START, 'glenn', '100', '500', DEADLINE))
+            self.assertEqual(db.final_roster('100')[0], [('7', 'Player')])
+            db.db.close()
+
+    def test_replacement_refuses_conflicting_reservation(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db = Storage(Path(tmp) / 'test.sqlite3')
+            db.reserve_creation(START, 'glenn', '500', DEADLINE)
+            db.record_created_thread(START, 'glenn', '999')
+            db.insert('100', START, '101', DEADLINE, EMOJIS, 'glenn')
+            self.assertFalse(db.reserve_deleted_thread_replacement(START, 'glenn', '100', '500', DEADLINE))
+            self.assertIsNotNone(db.by_thread('100'))
+            self.assertEqual(db.creation_reservation(START, 'glenn')['thread_id'], '999')
+            db.db.close()
+
+    def test_explicit_delete_removes_only_target_week_and_dungeon(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / 'test.sqlite3'
+            db = Storage(path)
+            db.insert('100', START, '101', DEADLINE, EMOJIS, 'glenn')
+            db.insert('200', START, '201', DEADLINE, EMOJIS, '4f')
+            db.insert('300', START + timedelta(days=7), '301', DEADLINE, EMOJIS, 'glenn')
+            db.finalize('100', {0: [('7', 'Player')]}, DEADLINE)
+            db.finalize('200', {1: [('8', 'Other')]}, DEADLINE)
+            self.assertTrue(db.delete_recruitment(
+                START, 'glenn', DEADLINE, expected_record=db.by_thread('100'), expected_reservation=None))
+            self.assertIsNone(db.by_thread('100'))
+            self.assertEqual(db.final_roster('100')[0], [])
+            self.assertEqual(db.final_roster('200')[1], [('8', 'Other')])
+            self.assertIsNotNone(db.by_thread('300'))
+            self.assertTrue(db.is_cancelled(START, 'glenn'))
+            self.assertFalse(db.is_cancelled(START, '4f'))
+            self.assertFalse(db.is_cancelled(START + timedelta(days=7), 'glenn'))
+            db.db.close()
+
+            db = Storage(path)
+            self.assertTrue(db.is_cancelled(START, 'glenn'))
+            self.assertFalse(db.reserve_creation(START, 'glenn', '500', DEADLINE))
+            self.assertTrue(db.reserve_creation(START, 'glenn', '500', DEADLINE, allow_cancelled=True))
+            self.assertTrue(db.is_cancelled(START, 'glenn'))  # Not cleared until creation succeeds.
+            db.record_created_thread(START, 'glenn', '400')
+            db.record_recruitment_message(START, 'glenn', '401')
+            db.insert('400', START, '401', DEADLINE, EMOJIS, 'glenn')
+            db.release_creation_reservation(START, 'glenn')
+            self.assertFalse(db.is_cancelled(START, 'glenn'))
+            self.assertEqual(db.by_week(START, 'glenn')['thread_id'], '400')
+            self.assertEqual(db.final_roster('400')[0], [])
+            db.db.close()
+
+    def test_explicit_delete_cleans_matching_creation_reservation(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db = Storage(Path(tmp) / 'test.sqlite3')
+            db.reserve_creation(START, 'glenn', '500', DEADLINE)
+            db.record_created_thread(START, 'glenn', '100')
+            db.record_recruitment_message(START, 'glenn', '101')
+            db.insert('100', START, '101', DEADLINE, EMOJIS, 'glenn')
+            self.assertTrue(db.delete_recruitment(
+                START, 'glenn', DEADLINE, expected_record=db.by_thread('100'),
+                expected_reservation=db.creation_reservation(START, 'glenn')))
+            self.assertIsNone(db.creation_reservation(START, 'glenn'))
+            self.assertIsNone(db.by_thread('100'))
+            db.db.close()
+
+    def test_explicit_delete_can_release_interrupted_creation(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db = Storage(Path(tmp) / 'test.sqlite3')
+            db.reserve_creation(START, 'glenn', '500', DEADLINE)
+            db.reserve_creation(START, '4f', '600', DEADLINE)
+            self.assertTrue(db.delete_recruitment(
+                START, 'glenn', DEADLINE, expected_record=None,
+                expected_reservation=db.creation_reservation(START, 'glenn')))
+            self.assertTrue(db.is_cancelled(START, 'glenn'))
+            self.assertIsNone(db.creation_reservation(START, 'glenn'))
+            self.assertIsNotNone(db.creation_reservation(START, '4f'))
+            self.assertFalse(db.delete_recruitment(
+                START, 'glenn', DEADLINE, expected_record=None, expected_reservation=None))
+            db.db.close()
+
+    def test_explicit_delete_rejects_changed_record_and_conflicting_claim(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db = Storage(Path(tmp) / 'test.sqlite3')
+            db.insert('100', START, '101', DEADLINE, EMOJIS, 'glenn')
+            old = db.by_thread('100')
+            db.finalize('100', {0: [('7', 'Player')]}, DEADLINE)
+            with self.assertRaises(RuntimeError):
+                db.delete_recruitment(START, 'glenn', DEADLINE,
+                                      expected_record=old, expected_reservation=None)
+            self.assertEqual(db.final_roster('100')[0], [('7', 'Player')])
+            # Simulate a conflicting reservation from an earlier interrupted operation.
+            with db.db:
+                db.db.execute("INSERT INTO creation_reservations VALUES ('glenn', ?, '500', '999', '998', ?)",
+                              (START.isoformat(), DEADLINE.isoformat()))
+            with self.assertRaises(RuntimeError):
+                db.delete_recruitment(START, 'glenn', DEADLINE,
+                                      expected_record=db.by_thread('100'),
+                                      expected_reservation=db.creation_reservation(START, 'glenn'))
+            self.assertIsNotNone(db.by_thread('100'))
+            self.assertFalse(db.is_cancelled(START, 'glenn'))
+            db.db.close()
 
     def test_closed_recruitment_still_blocks_new_thread_same_week(self):
         with tempfile.TemporaryDirectory() as tmp:
