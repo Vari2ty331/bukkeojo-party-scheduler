@@ -2,6 +2,7 @@
 import ast
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -39,6 +40,49 @@ class CommandAppearanceTests(unittest.TestCase):
                              if k.arg == 'name' and isinstance(k.value, ast.Constant)]
                     actual.update(names)
         self.assertEqual(actual, expected)
+
+    def test_party_group_has_restrictive_discord_default_permissions(self):
+        group = next(n.value for n in self.tree.body if isinstance(n, ast.Assign)
+                     and any(isinstance(t, ast.Name) and t.id == 'party' for t in n.targets))
+        self.assertEqual(ast.unparse(group.func), 'app_commands.Group')
+        permissions = next(k.value for k in group.keywords if k.arg == 'default_permissions')
+        self.assertEqual(ast.unparse(permissions), 'discord.Permissions.none()')
+
+    def test_every_party_command_checks_organizer_before_work(self):
+        checked = set()
+        for node in self.tree.body:
+            if not isinstance(node, ast.AsyncFunctionDef):
+                continue
+            if not any(isinstance(d, ast.Call) and ast.unparse(d.func) == 'party.command'
+                       for d in node.decorator_list):
+                continue
+            first = node.body[0]
+            self.assertIsInstance(first, ast.If, node.name)
+            self.assertEqual(ast.unparse(first.test), 'not await require_organizer(interaction)', node.name)
+            self.assertIsInstance(first.body[0], ast.Return, node.name)
+            checked.add(node.name)
+        self.assertEqual(checked, {'ping', 'emojis', 'create', 'delete', 'report', 'reopen', 'close'})
+
+    def test_organizer_role_and_administrator_access(self):
+        # Exercise the existing authorization function without connecting to Discord.
+        class Member:
+            def __init__(self, roles, administrator=False):
+                self.roles = [SimpleNamespace(id=role) for role in roles]
+                self.guild_permissions = SimpleNamespace(administrator=administrator)
+
+        fn = next(n for n in self.tree.body if isinstance(n, ast.FunctionDef) and n.name == 'organizer')
+        namespace = {'discord': SimpleNamespace(Member=Member, Interaction=object),
+                     'GUILD_ID': 100, 'ORGANIZER_ROLE_ID': 200}
+        exec(compile(ast.Module(body=[fn], type_ignores=[]), '<organizer>', 'exec'), namespace)
+        organizer = namespace['organizer']
+        def interaction(member, guild_id=100):
+            return SimpleNamespace(user=member, guild=SimpleNamespace(id=guild_id))
+        self.assertTrue(organizer(interaction(Member([200]))))
+        self.assertTrue(organizer(interaction(Member([], administrator=True))))
+        self.assertFalse(organizer(interaction(Member([300]))))
+        self.assertFalse(organizer(interaction(Member([200]), guild_id=999)))
+        self.assertFalse(organizer(interaction(SimpleNamespace())))
+        self.assertFalse(organizer(SimpleNamespace(user=Member([200]), guild=None)))
 
     def test_manual_create_and_default_delete_share_week_boundary(self):
         functions = {n.name: n for n in self.tree.body if isinstance(n, ast.AsyncFunctionDef)}

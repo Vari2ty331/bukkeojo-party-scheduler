@@ -74,7 +74,10 @@ class CalendarTests(unittest.TestCase):
 
     def test_manual_only_starter(self):
         text = starter_content(START, None, '4f')
-        self.assertIn('신청 마감: 운영진이 직접 마감합니다.', text)
+        self.assertEqual(text, '**4관 파티 모집 | 11/26 ~ 12/02**\n\n'
+                         '참여 가능한 날의 **요일 이모지**를 모두 눌러 주세요.\n'
+                         '시간 제한이 있다면 이 스레드에 댓글로 남겨 주세요.')
+        self.assertNotIn('신청 마감', text)
         self.assertNotIn('⏰', text)
         self.assertTrue(is_starter_message(text, START, '4f'))
 
@@ -85,7 +88,10 @@ class CalendarTests(unittest.TestCase):
         self.assertNotIn('<@&444555666>', glenn)
         self.assertTrue(fourf.startswith('<@&444555666>\n'))
         self.assertNotIn('<@&111222333>', fourf)
-        self.assertIn('11/26(목)', glenn)
+        self.assertIn('11/26 ~ 12/02', glenn)
+        self.assertNotIn('11/26(목)', glenn)
+        self.assertNotIn('12/02(수)', glenn)
+        self.assertIn('⏰ 신청 마감: **11/25 23:00 (한국 시간)**', glenn)
         # Historical posts without role mentions remain unchanged.
         self.assertFalse(starter_content(START, DEADLINE, 'glenn').startswith('<@&'))
 
@@ -95,6 +101,18 @@ class CalendarTests(unittest.TestCase):
         self.assertTrue(is_starter_message('🔒 모집 마감\n' + old_starter, START, '4f'))
         self.assertFalse(is_starter_message(old_starter, START, 'glenn'))
         self.assertFalse(is_starter_message(old_starter, START + timedelta(days=7), '4f'))
+
+    def test_previous_calendar_starter_is_still_recognized(self):
+        old = ('<@&123456789>\n**글렌 베르나 파티 모집 | 11/26 ~ 12/02**\n'
+               '11/26(목) · 11/27(금) · 11/28(토) · 11/29(일) · '
+               '11/30(월) · 12/01(화) · 12/02(수)\n\n'
+               '참여 가능한 날의 **요일 이모지**를 모두 눌러 주세요.\n'
+               '시간 제한이 있다면 이 스레드에 댓글로 남겨 주세요.\n'
+               '신청 마감: 운영진이 직접 마감합니다.')
+        self.assertTrue(is_starter_message(old, START, 'glenn'))
+        self.assertFalse(is_starter_message(old, START, '4f'))
+        self.assertFalse(is_starter_message(old, START + timedelta(days=7), 'glenn'))
+        self.assertFalse(is_starter_message(old.replace('11/26 ~ 12/02', '11/26 ~ 12/03'), START, 'glenn'))
 
     def test_korean_starter_is_a_party_invitation(self):
         post = starter_content(START, DEADLINE, 'glenn')

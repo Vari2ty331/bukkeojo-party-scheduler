@@ -4,8 +4,10 @@ Both manual `/파티 생성` and the automatic Monday (4F) / Wednesday (Glenn)
 recruitment use the same `create_recruitment()` method. A new recruitment
 includes a Pillow-generated, Sunday–Saturday partial calendar attachment
 on the original signup message. Only the seven Thursday–Wednesday dates
-are highlighted. The date calculation, text dates, role mentions,
-reactions, deadline, duplicate check and database are unchanged.
+are highlighted. The title still displays the date range; the separate
+text list of dates is omitted. When automatic closing is disabled, no
+closing notice is shown. Date calculation, role mentions, reactions,
+configured deadlines, duplicate protection and database are unchanged.
 
 ## One-time setup on Oracle
 

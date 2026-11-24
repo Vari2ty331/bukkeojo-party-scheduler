@@ -50,7 +50,13 @@ if not all((GUILD_ID, GLENN_TEXT_CHANNEL_ID, FOURF_TEXT_CHANNEL_ID)):
 if ROLE_MENTIONS_ENABLED and not all((GLENN_PARTICIPANT_ROLE_ID, FOURF_PARTICIPANT_ROLE_ID)):
     raise SystemExit('역할 멘션을 사용하려면 .env에 두 던전의 참여자 역할 ID를 입력해 주세요.')
 
-party = app_commands.Group(name='파티', description='주간 파티 모집을 관리합니다.')
+# Discord-side visibility: disabled for ordinary members by default.
+# Grant ORGANIZER_ROLE_ID access to /파티 in Server Settings > Integrations.
+# The bot token cannot configure custom-role command permission overrides.
+party = app_commands.Group(
+    name='파티', description='주간 파티 모집을 관리합니다.',
+    default_permissions=discord.Permissions.none(),
+)
 REOPEN_NOTE = '\n\n🔓 재모집 중 — 기존 신청자는 다시 누르지 않아도 됩니다.'
 
 
@@ -545,6 +551,8 @@ bot = RaidBot()
 
 @party.command(name='상태', description='파티 모집 봇의 작동 상태를 확인합니다.')
 async def ping(interaction: discord.Interaction):
+    if not await require_organizer(interaction):
+        return
     mention_status = '켜짐' if ROLE_MENTIONS_ENABLED else '꺼짐'
     await interaction.response.send_message(
         f'✅ 파티 모집 봇이 정상 작동 중입니다.\n참여자 역할 멘션: {mention_status}', ephemeral=True)

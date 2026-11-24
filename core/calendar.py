@@ -56,15 +56,14 @@ def title(thursday: date, raid_type: str = "legacy") -> str:
 
 def starter_content(thursday: date, deadline: datetime | None, raid_type: str = "legacy",
                     role_id: int | None = None) -> str:
-    items = [f"{day:%m/%d}({label})" for day, label in zip(week_days(thursday), KOREAN_WEEKDAYS)]
+    final = week_days(thursday)[-1]
     role_mention = f"<@&{role_id}>\n" if role_id else ""
     return (
-        role_mention + f"**{raid_label(raid_type)} 파티 모집 | {thursday:%m/%d} ~ {(thursday + timedelta(days=6)):%m/%d}**\n"
-        + " · ".join(items)
+        role_mention + f"**{raid_label(raid_type)} 파티 모집 | {thursday:%m/%d} ~ {final:%m/%d}**"
         + "\n\n참여 가능한 날의 **요일 이모지**를 모두 눌러 주세요."
         + "\n시간 제한이 있다면 이 스레드에 댓글로 남겨 주세요."
         + (f"\n⏰ 신청 마감: **{deadline.astimezone(KST):%m/%d %H:%M} (한국 시간)**"
-           if deadline is not None else "\n신청 마감: 운영진이 직접 마감합니다.")
+           if deadline is not None else "")
     )
 
 
@@ -76,11 +75,17 @@ def is_starter_message(content: str, thursday: date, raid_type: str) -> bool:
     so editing configuration cannot cause the role notification to fire twice
     after a crash between message send and database persistence.
     """
+    final = week_days(thursday)[-1]
+    # New and previous party titles already contain both dates. The PNG now
+    # replaces the separate date list, so it is no longer needed for recovery.
+    header = f"**{raid_label(raid_type)} 파티 모집 | {thursday:%m/%d} ~ {final:%m/%d}**"
+    if header in content.splitlines():
+        return True
+    # Retain compatibility with the original, older recruitment format.
     return (
-        (f"**{raid_label(raid_type)} — 이번 주 참여 가능 요일 조사**" in content
-         or f"**{raid_label(raid_type)} 파티 모집 | {thursday:%m/%d}" in content)
+        f"**{raid_label(raid_type)} — 이번 주 참여 가능 요일 조사**" in content
         and f"{thursday:%m/%d}({KOREAN_WEEKDAYS[0]})" in content
-        and f"{thursday + timedelta(days=6):%m/%d}({KOREAN_WEEKDAYS[6]})" in content
+        and f"{final:%m/%d}({KOREAN_WEEKDAYS[6]})" in content
     )
 
 
