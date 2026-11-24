@@ -416,7 +416,7 @@ class StorageTests(unittest.TestCase):
             self.assertEqual(db.final_roster('100')[0], [('7', 'Player')])
             # Simulate a conflicting reservation from an earlier interrupted operation.
             with db.db:
-                db.db.execute("INSERT INTO creation_reservations VALUES ('glenn', ?, '500', '999', '998', ?)",
+                db.db.execute("INSERT INTO creation_reservations (raid_type,week_start,parent_channel_id,thread_id,message_id,created_at) VALUES ('glenn', ?, '500', '999', '998', ?)",
                               (START.isoformat(), DEADLINE.isoformat()))
             with self.assertRaises(RuntimeError):
                 db.delete_recruitment(START, 'glenn', DEADLINE,

@@ -27,7 +27,7 @@ class CommandAppearanceTests(unittest.TestCase):
         self.assertIn('if ROLE_MENTIONS_ENABLED and not all', self.source)
 
     def test_korean_subcommands(self):
-        expected = {'상태', '이모지', '생성', '명단', '마감', '재개', '삭제'}
+        expected = {'상태', '이모지', '생성', '명단', '마감', '재개', '삭제', '글렌설정'}
         actual = set()
         for node in ast.walk(self.tree):
             if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
@@ -61,7 +61,7 @@ class CommandAppearanceTests(unittest.TestCase):
             self.assertEqual(ast.unparse(first.test), 'not await require_organizer(interaction)', node.name)
             self.assertIsInstance(first.body[0], ast.Return, node.name)
             checked.add(node.name)
-        self.assertEqual(checked, {'ping', 'emojis', 'create', 'delete', 'report', 'reopen', 'close'})
+        self.assertEqual(checked, {'ping', 'emojis', 'create', 'delete', 'report', 'reopen', 'close', 'glenn_settings'})
 
     def test_organizer_role_and_administrator_access(self):
         # Exercise the existing authorization function without connecting to Discord.

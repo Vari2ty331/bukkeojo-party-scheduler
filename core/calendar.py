@@ -14,6 +14,14 @@ RAID_TYPES = ("glenn", "4f")
 # Number of days before the Thursday raid week, and local opening time.
 RECRUITMENT_OPENINGS = {"4f": (3, "11:00"), "glenn": (1, "11:00")}
 WEEKLY_RESET_TIME = time(7, 0)  # Thursday 07:00 KST
+DEFAULT_GLENN_RUNS = 5
+MAX_GLENN_MEMO_LENGTH = 1000
+FOURF_RUN_EMOJIS = {3: "3️⃣", 4: "4️⃣", 5: "5️⃣"}
+FOURF_PREFERENCE_CONTENT = (
+    "**추가 릴 희망 조사**\n"
+    "기본 2릴이며, 추가 진행을 희망하시는 분은 원하는 최대 횟수에 반응해 주세요.\n"
+    "3️⃣ 3릴 · 4️⃣ 4릴 · 5️⃣ 5릴 이상"
+)
 
 
 def raid_label(raid_type: str) -> str:
@@ -60,11 +68,15 @@ def legacy_thread_title(thursday: date, raid_type: str) -> str:
 
 
 def starter_content(thursday: date, deadline: datetime | None, raid_type: str = "legacy",
-                    role_id: int | None = None) -> str:
+                    role_id: int | None = None, *, glenn_runs: int = DEFAULT_GLENN_RUNS,
+                    glenn_memo: str = "") -> str:
     final = week_days(thursday)[-1]
     role_mention = f"<@&{role_id}>\n" if role_id else ""
+    glenn_info = (f"\n\n**이번주 글렌 횟수 {glenn_runs}릴**"
+                  + (f"\n{glenn_memo}" if glenn_memo else "")) if raid_type == "glenn" else ""
     return (
         role_mention + f"**{raid_label(raid_type)} 파티 모집 | {thursday:%m/%d} ~ {final:%m/%d}**"
+        + glenn_info
         + "\n\n참여 가능한 날의 **요일 이모지**를 모두 눌러 주세요."
         + "\n시간 제한이 있다면 이 스레드에 댓글로 남겨 주세요."
         + ("\n평일은 저녁, 주말/공휴일은 점심부터 출발" if raid_type == "glenn" else "")

@@ -9,6 +9,8 @@ import sqlite3
 from datetime import timedelta
 from pathlib import Path
 
+from core.calendar import DEFAULT_GLENN_RUNS, MAX_GLENN_MEMO_LENGTH, FOURF_RUN_EMOJIS
+
 
 SCHEMA = """
     CREATE TABLE IF NOT EXISTS recruitments (
@@ -23,6 +25,7 @@ SCHEMA = """
       closed_at TEXT,
       reactions_cleared INTEGER NOT NULL DEFAULT 0,
       reopened_with_snapshot INTEGER NOT NULL DEFAULT 0,
+      preference_message_id TEXT,
       UNIQUE(raid_type, week_start)
     );
 """
@@ -39,6 +42,29 @@ def merge_rosters(saved_roster, current_roster):
         people = {str(uid): name for uid, name in saved_roster.get(day, [])}
         people.update((str(uid), name) for uid, name in current_roster.get(day, []))
         result[day] = sorted(people.items(), key=lambda person: (person[1].casefold(), person[0]))
+    return result
+
+
+def merge_run_preferences(saved, current):
+    """One desired run group per user; highest reaction within each submission.
+
+    A new explicit selection overrides the saved selection after reopening.
+    No new selection keeps the saved preference. 5 means five or more runs.
+    """
+    def by_user(roster):
+        result = {}
+        for count in sorted(FOURF_RUN_EMOJIS):
+            for uid, name in roster.get(count, []):
+                result[str(uid)] = (count, name)
+        return result
+
+    selections = by_user(saved)
+    selections.update(by_user(current))
+    result = {count: [] for count in FOURF_RUN_EMOJIS}
+    for uid, (count, name) in selections.items():
+        result[count].append((uid, name))
+    for people in result.values():
+        people.sort(key=lambda entry: (entry[1].casefold(), entry[0]))
     return result
 
 
@@ -69,6 +95,7 @@ class Storage:
               parent_channel_id TEXT NOT NULL,
               thread_id TEXT,
               message_id TEXT,
+              preference_message_id TEXT,
               created_at TEXT NOT NULL,
               PRIMARY KEY (raid_type, week_start)
             );
@@ -78,6 +105,19 @@ class Storage:
               week_start TEXT NOT NULL,
               cancelled_at TEXT NOT NULL,
               PRIMARY KEY (raid_type, week_start)
+            );
+            CREATE TABLE IF NOT EXISTS glenn_settings (
+              singleton INTEGER PRIMARY KEY CHECK(singleton=1),
+              run_count INTEGER NOT NULL CHECK(run_count>0),
+              memo TEXT NOT NULL DEFAULT ''
+            );
+            CREATE TABLE IF NOT EXISTS final_run_preferences (
+              thread_id TEXT NOT NULL,
+              user_id TEXT NOT NULL,
+              desired_runs INTEGER NOT NULL CHECK(desired_runs IN (3,4,5)),
+              display_name TEXT NOT NULL,
+              PRIMARY KEY(thread_id, user_id),
+              FOREIGN KEY(thread_id) REFERENCES recruitments(thread_id)
             );
             CREATE TABLE IF NOT EXISTS final_roster (
               thread_id TEXT NOT NULL,
@@ -95,7 +135,34 @@ class Storage:
             with self.db:
                 self.db.execute("""ALTER TABLE recruitments ADD COLUMN reopened_with_snapshot
                                    INTEGER NOT NULL DEFAULT 0""")
+        # New columns are nullable so historical recruitments remain valid.
+        for table in ('recruitments', 'creation_reservations'):
+            columns = {row[1] for row in self.db.execute(f'PRAGMA table_info({table})')}
+            if 'preference_message_id' not in columns:
+                self.db.execute(f'ALTER TABLE {table} ADD COLUMN preference_message_id TEXT')
+        self.db.execute('INSERT OR IGNORE INTO glenn_settings (singleton,run_count,memo) VALUES (1,?,?)',
+                        (DEFAULT_GLENN_RUNS, ''))
         self.db.commit()
+
+    def glenn_settings(self):
+        row = self.db.execute('SELECT run_count,memo FROM glenn_settings WHERE singleton=1').fetchone()
+        return row['run_count'], row['memo']
+
+    def update_glenn_settings(self, *, run_count=None, memo=None, clear_memo=False):
+        if run_count is not None and (type(run_count) is not int or not 1 <= run_count <= 99):
+            raise ValueError('횟수는 1~99 사이의 정수로 입력해 주세요.')
+        if clear_memo and memo is not None:
+            raise ValueError('메모 입력과 메모초기화를 동시에 사용할 수 없습니다.')
+        if memo is not None and len(memo) > MAX_GLENN_MEMO_LENGTH:
+            raise ValueError(f'메모는 {MAX_GLENN_MEMO_LENGTH}자 이내로 입력해 주세요.')
+        with self.db:
+            self.db.execute('BEGIN IMMEDIATE')
+            old_count, old_memo = self.glenn_settings()
+            count = old_count if run_count is None else run_count
+            new_memo = '' if clear_memo else (old_memo if memo is None else memo.strip())
+            self.db.execute('UPDATE glenn_settings SET run_count=?, memo=? WHERE singleton=1',
+                            (count, new_memo))
+        return count, new_memo
 
     def _migrate_old_recruitments(self):
         """Rebuild old table, preserving thread IDs, metadata and roster rows.
@@ -233,6 +300,7 @@ class Storage:
                     or job['message_id'] != rec['message_id']):
                 raise RuntimeError('Conflicting creation reservation; inspect before deleting')
             if rec is not None:
+                self.db.execute('DELETE FROM final_run_preferences WHERE thread_id=?', (rec['thread_id'],))
                 self.db.execute('DELETE FROM final_roster WHERE thread_id=?', (rec['thread_id'],))
                 self.db.execute('DELETE FROM recruitments WHERE thread_id=?', (rec['thread_id'],))
             self.db.execute('DELETE FROM creation_reservations WHERE raid_type=? AND week_start=?', key)
@@ -263,6 +331,17 @@ class Storage:
             if cur.rowcount != 1:
                 raise RuntimeError('Missing or conflicting creation reservation')
 
+    def record_preference_message(self, start, message_id):
+        """Persist the 4F survey message before committing the recruitment."""
+        with self.db:
+            cur = self.db.execute("""
+                UPDATE creation_reservations SET preference_message_id=?
+                WHERE raid_type='4f' AND week_start=?
+                  AND (preference_message_id IS NULL OR preference_message_id=?)
+            """, (str(message_id), start.isoformat(), str(message_id)))
+            if cur.rowcount != 1:
+                raise RuntimeError('Missing or conflicting preference message reservation')
+
     def release_creation_reservation(self, start, raid_type):
         '''Release only after the actual recruitment row is committed.'''
         with self.db:
@@ -282,17 +361,21 @@ class Storage:
             (raid_type, start.isoformat())
         ).fetchone()
 
-    def insert(self, thread_id, start, message_id, deadline_at, emoji_ids, raid_type):
+    def insert(self, thread_id, start, message_id, deadline_at, emoji_ids, raid_type, *,
+               preference_message_id=None):
         if raid_type not in ("glenn", "4f"):
             raise ValueError("New recruitments must be for 'glenn' or '4f'")
+        if preference_message_id is not None and raid_type != '4f':
+            raise ValueError('Only 4F has a run preference survey')
         with self.db:
             self.db.execute("""
                 INSERT INTO recruitments
-                (thread_id,raid_type,week_start,week_end,message_id,deadline_at,emoji_ids_json)
-                VALUES (?,?,?,?,?,?,?)
+                (thread_id,raid_type,week_start,week_end,message_id,deadline_at,emoji_ids_json,preference_message_id)
+                VALUES (?,?,?,?,?,?,?,?)
             """, (str(thread_id), raid_type, start.isoformat(),
                   (start + timedelta(days=6)).isoformat(), str(message_id),
-                  (deadline_at.isoformat() if deadline_at is not None else ""), json.dumps(emoji_ids)))
+                  (deadline_at.isoformat() if deadline_at is not None else ""), json.dumps(emoji_ids),
+                  str(preference_message_id) if preference_message_id is not None else None))
             # Only a successful creation releases the cancellation marker.
             self.db.execute('DELETE FROM cancelled_weeks WHERE raid_type=? AND week_start=?',
                             (raid_type, start.isoformat()))
@@ -312,8 +395,8 @@ class Storage:
     def reopen(self, thread_id, deadline_at, emoji_ids):
         """Reopen a CLOSED recruitment while retaining its final roster baseline.
 
-        The Discord layer must clear any stale reactions and restore the bot's
-        seven weekday reactions before invoking this DB transition.
+        The Discord layer clears stale reactions before this transition and
+        restores both sets of options afterward. The saved snapshots remain.
         """
         with self.db:
             rec = self.by_thread(thread_id)
@@ -340,7 +423,7 @@ class Storage:
             if cur.rowcount != 1:
                 raise ValueError('The recruitment is not currently reopened')
 
-    def finalize(self, thread_id, roster, closed_at):
+    def finalize(self, thread_id, roster, closed_at, *, run_preferences=None):
         """Atomic snapshot and close, completed before deleting reactions."""
         with self.db:
             rec = self.by_thread(thread_id)
@@ -348,6 +431,18 @@ class Storage:
                 raise ValueError(f"Unknown recruitment thread {thread_id}")
             if rec['status'] == 'closed':
                 return
+            if rec['preference_message_id'] is not None and run_preferences is None:
+                raise ValueError('The 4F preference survey must be captured before closing')
+            if run_preferences is not None and rec['raid_type'] != '4f':
+                raise ValueError('Only 4F has a run preference survey')
+            self.db.execute("DELETE FROM final_run_preferences WHERE thread_id=?", (str(thread_id),))
+            if run_preferences is not None:
+                for count, users in merge_run_preferences({}, run_preferences).items():
+                    for uid, name in users:
+                        self.db.execute("""
+                            INSERT INTO final_run_preferences (thread_id,user_id,desired_runs,display_name)
+                            VALUES (?,?,?,?)
+                        """, (str(thread_id), str(uid), count, name))
             self.db.execute("DELETE FROM final_roster WHERE thread_id=?", (str(thread_id),))
             for day_index, users in roster.items():
                 for uid, name in users:
@@ -377,3 +472,13 @@ class Storage:
         for row in rows:
             roster[row['day_index']].append((row['user_id'], row['display_name']))
         return roster
+
+    def final_run_preferences(self, thread_id):
+        rows = self.db.execute("""
+            SELECT desired_runs,user_id,display_name FROM final_run_preferences
+            WHERE thread_id=? ORDER BY desired_runs,display_name
+        """, (str(thread_id),)).fetchall()
+        result = {count: [] for count in FOURF_RUN_EMOJIS}
+        for row in rows:
+            result[row['desired_runs']].append((row['user_id'], row['display_name']))
+        return result

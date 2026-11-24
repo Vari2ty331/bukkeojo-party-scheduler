@@ -18,8 +18,9 @@ from dotenv import load_dotenv
 
 from core.calendar import (ENGLISH_KEYS, KOREAN_WEEKDAYS, KST, RAID_TYPES, raid_label,
                            is_starter_message, recruitment_week_start, due_openings, opening_for_week, local_dt,
-                           starter_content, title, legacy_thread_title, week_days)
-from core.storage import Storage, merge_rosters
+                           starter_content, title, legacy_thread_title, week_days,
+                           FOURF_RUN_EMOJIS, FOURF_PREFERENCE_CONTENT)
+from core.storage import Storage, merge_rosters, merge_run_preferences
 from core.calendar_image import render_calendar_png
 
 ROOT = Path(__file__).resolve().parent
@@ -58,6 +59,8 @@ party = app_commands.Group(
     default_permissions=discord.Permissions.none(),
 )
 REOPEN_NOTE = '\n\n🔓 재모집 중 — 기존 신청자는 다시 누르지 않아도 됩니다.'
+PREFERENCE_REOPEN_NOTE = '\n\n🔓 기존 희망 횟수는 유지됩니다. 변경하려면 새로 반응해 주세요.'
+CLOSED_PREFIX = '🔒 모집 마감\n'
 
 
 def configured_deadline(start: date, raid_type: str) -> datetime | None:
@@ -78,11 +81,14 @@ def participant_role_id(raid_type: str) -> int:
     raise ValueError(f'지원하지 않는 던전입니다: {raid_type}')
 
 
-def existing_message_role_id(content: str) -> int | None:
-    # Used only when editing a previously published starter (e.g. reopen).
-    # An edit must never send a fresh role notification.
-    match = re.search(r'<@&(\d+)>', content)
-    return int(match.group(1)) if match else None
+def reopened_starter_content(content: str, deadline: datetime | None) -> str:
+    """Keep the original weekly announcement, including Glenn's historic memo."""
+    body = content.removeprefix(CLOSED_PREFIX).removesuffix(REOPEN_NOTE)
+    # Only replace the bot-generated trailing deadline, not arbitrary memo text.
+    body = re.sub(r'\n⏰ 신청 마감: \*\*\d{2}/\d{2} \d{2}:\d{2} \(한국 시간\)\*\*\Z', '', body)
+    if deadline is not None:
+        body += f'\n⏰ 신청 마감: **{deadline.astimezone(KST):%m/%d %H:%M} (한국 시간)**'
+    return body + REOPEN_NOTE
 
 
 def organizer(interaction: discord.Interaction) -> bool:
@@ -188,6 +194,32 @@ class RaidBot(commands.Bot):
                 '모든 역할 멘션 권한을 부여해 주세요.')
         return role
 
+    async def seed_run_reactions(self, message):
+        for emoji in FOURF_RUN_EMOJIS.values():
+            if not any(str(r.emoji).replace('\ufe0f', '') == emoji.replace('\ufe0f', '')
+                       and r.me for r in message.reactions):
+                await message.add_reaction(emoji)
+
+    async def ensure_preference_message(self, thread, start, *, message_id=None):
+        """Create once, or recover a bot-owned survey after a partial creation."""
+        if message_id is not None:
+            message = await thread.fetch_message(int(message_id))
+        else:
+            candidates = []
+            async for candidate in thread.history(limit=100, oldest_first=True):
+                if candidate.author.id == self.user.id and candidate.content == FOURF_PREFERENCE_CONTENT:
+                    candidates.append(candidate)
+            if len(candidates) > 1:
+                raise RuntimeError('추가 릴 희망 조사 메시지가 여러 개 있습니다. 운영진 확인이 필요합니다.')
+            if candidates:
+                message = candidates[0]
+            else:
+                message = await thread.send(FOURF_PREFERENCE_CONTENT,
+                                            allowed_mentions=discord.AllowedMentions.none())
+            self.store.record_preference_message(start, message.id)
+        await self.seed_run_reactions(message)
+        return message
+
     async def create_recruitment(self, start: date, raid_type: str, *, allow_deleted_replacement=False):
         if raid_type not in RAID_TYPES:
             raise ValueError(f'지원하지 않는 던전입니다: {raid_type}')
@@ -220,6 +252,9 @@ class RaidBot(commands.Bot):
                         for emoji in await self.get_emojis():
                             if not any(getattr(r.emoji, 'id', None) == emoji.id for r in message.reactions):
                                 await message.add_reaction(emoji)
+                        if existing['preference_message_id'] is not None:
+                            preferences = await channel.fetch_message(int(existing['preference_message_id']))
+                            await self.seed_run_reactions(preferences)
                     return existing, False
 
             emojis = await self.get_emojis()  # fail BEFORE trying to create
@@ -289,8 +324,10 @@ class RaidBot(commands.Bot):
                 message = await thread.fetch_message(int(job['message_id']))
             else:
                 # Recover from the narrow crash window after sending the starter.
+                glenn_runs, glenn_memo = self.store.glenn_settings()
                 expected_message = starter_content(
-                    start, deadline, raid_type, role_id=mention_role.id if mention_role else None)
+                    start, deadline, raid_type, role_id=mention_role.id if mention_role else None,
+                    glenn_runs=glenn_runs, glenn_memo=glenn_memo)
                 previous = []
                 async for candidate in thread.history(limit=100, oldest_first=True):
                     if (candidate.author.id == self.user.id
@@ -317,14 +354,21 @@ class RaidBot(commands.Bot):
                         expected_message, file=attachment, allowed_mentions=allow_this_role)
                 self.store.record_recruitment_message(start, raid_type, message.id)
 
-            # The database identity is now durable; both the manual command and
-            # timer check this same key before attempting another creation.
-            ids = {str(i): str(e.id) for i, e in enumerate(emojis)}
-            self.store.insert(thread.id, start, message.id, deadline, ids, raid_type)
-            self.store.release_creation_reservation(start, raid_type)
             for emoji in emojis:
                 if not any(getattr(r.emoji, 'id', None) == emoji.id for r in message.reactions):
                     await message.add_reaction(emoji)
+            preference_message_id = None
+            if raid_type == '4f':
+                job = self.store.creation_reservation(start, raid_type)
+                preferences = await self.ensure_preference_message(
+                    thread, start, message_id=job['preference_message_id'])
+                preference_message_id = preferences.id
+            # Commit only after both messages and their reaction options exist.
+            # The reservation survives failures, letting a retry reuse messages.
+            ids = {str(i): str(e.id) for i, e in enumerate(emojis)}
+            self.store.insert(thread.id, start, message.id, deadline, ids, raid_type,
+                              preference_message_id=preference_message_id)
+            self.store.release_creation_reservation(start, raid_type)
             return self.store.by_thread(thread.id), True
 
     async def delete_party(self, start, raid_type, *, invoking_channel_id, expected_thread_id=None):
@@ -436,7 +480,34 @@ class RaidBot(commands.Bot):
             roster = merge_rosters(self.store.final_roster(rec['thread_id']), roster)
         return await self.resolve_roster_names(channel.guild, roster)
 
-    def report_embed(self, rec, roster):
+    async def live_run_preferences(self, rec):
+        if rec['preference_message_id'] is None:
+            return None  # Glenn and pre-upgrade 4F threads have no separate survey.
+        channel = await self.fetch_channel(int(rec['thread_id']))
+        message = await channel.fetch_message(int(rec['preference_message_id']))
+        count_by_emoji = {emoji.replace('\ufe0f', ''): count for count, emoji in FOURF_RUN_EMOJIS.items()}
+        current = {count: [] for count in FOURF_RUN_EMOJIS}
+        for reaction in message.reactions:
+            count = count_by_emoji.get(str(reaction.emoji).replace('\ufe0f', ''))
+            if count is None:
+                continue
+            async for user in reaction.users(limit=None):
+                if not user.bot:
+                    current[count].append((str(user.id), user.display_name))
+        saved = (self.store.final_run_preferences(rec['thread_id'])
+                 if rec['reopened_with_snapshot'] else {})
+        preferences = merge_run_preferences(saved, current)
+        resolved = await self.resolve_roster_names(channel.guild, preferences)
+        return {count: resolved[count] for count in FOURF_RUN_EMOJIS}
+
+    async def saved_run_preferences(self, guild, rec):
+        if rec['preference_message_id'] is None:
+            return None
+        resolved = await self.resolve_roster_names(
+            guild, self.store.final_run_preferences(rec['thread_id']))
+        return {count: resolved[count] for count in FOURF_RUN_EMOJIS}
+
+    def report_embed(self, rec, roster, run_preferences=None):
         start = date.fromisoformat(rec['week_start'])
         status = '모집 마감' if rec['status'] == 'closed' else (
             '마감 지연 — 운영진 확인 필요' if rec['status'] == 'review_needed' else '모집 중')
@@ -448,7 +519,14 @@ class RaidBot(commands.Bot):
             # One field per day; Discord embed field max value length is 1024.
             embed.add_field(name=f'{day:%m/%d} ({KOREAN_WEEKDAYS[i]}) — {len(names)}명',
                             value=value[:1020], inline=False)
-        embed.set_footer(text='요일별 신청 명단만 표시합니다. 개인 시간 제약은 포함하지 않습니다.')
+        if run_preferences is not None:
+            embed.add_field(name='추가 릴 희망자', value='기본 2릴 · 희망 횟수이며 확정된 배정이 아닙니다.', inline=False)
+            for count in FOURF_RUN_EMOJIS:
+                names = [name for _uid, name in run_preferences.get(count, [])]
+                label = f'{count}릴' if count < 5 else '5릴 이상'
+                embed.add_field(name=f'{label} — {len(names)}명',
+                                value=(', '.join(names) if names else '신청 없음')[:1020], inline=False)
+        embed.set_footer(text='개인 시간 제약은 포함하지 않습니다.')
         return embed
 
     async def finish(self, rec, *, recovered=False):
@@ -458,19 +536,23 @@ class RaidBot(commands.Bot):
                 raise ValueError('이미 삭제된 모집입니다.')
             if rec['status'] != 'closed':
                 roster = await self.live_roster(rec)
-                self.store.finalize(rec['thread_id'], roster, datetime.now(KST))
+                preferences = await self.live_run_preferences(rec)
+                self.store.finalize(rec['thread_id'], roster, datetime.now(KST),
+                                    run_preferences=preferences)
             rec = self.store.by_thread(rec['thread_id'])
             if not rec['reactions_cleared']:
                 thread = await self.fetch_channel(int(rec['thread_id']))
                 msg = await thread.fetch_message(int(rec['message_id']))
-                await msg.clear_reactions()  # requires Manage Messages
-                clean_body = msg.content.replace(REOPEN_NOTE, '')
-                if clean_body.startswith('🔒 모집 마감\n'):
-                    closed_body = clean_body
-                else:
-                    closed_body = '🔒 모집 마감\n' + clean_body
-                if msg.content != closed_body:
-                    await msg.edit(content=closed_body, allowed_mentions=discord.AllowedMentions.none())
+                messages = [(msg, REOPEN_NOTE)]
+                if rec['preference_message_id'] is not None:
+                    preference_message = await thread.fetch_message(int(rec['preference_message_id']))
+                    messages.append((preference_message, PREFERENCE_REOPEN_NOTE))
+                for message, reopen_note in messages:
+                    await message.clear_reactions()  # both snapshots already saved
+                    closed_body = CLOSED_PREFIX + message.content.removeprefix(CLOSED_PREFIX).removesuffix(reopen_note)
+                    if message.content != closed_body:
+                        await message.edit(content=closed_body, allowed_mentions=discord.AllowedMentions.none())
+                # Set only after BOTH messages have been cleared and edited.
                 self.store.mark_reactions_cleared(rec['thread_id'])
             return self.store.by_thread(rec['thread_id'])
 
@@ -509,36 +591,45 @@ class RaidBot(commands.Bot):
             channel = await self.fetch_channel(int(rec['thread_id']))
             message = await channel.fetch_message(int(rec['message_id']))
             emojis = await self.get_emojis()  # verify available before editing anything
+            preference_message = (await channel.fetch_message(int(rec['preference_message_id']))
+                                  if rec['preference_message_id'] is not None else None)
 
             if rec['status'] == 'closed':
                 # Remove any post-close reactions before reopening, so late
                 # signups made while CLOSED cannot slip into the live roster.
                 # Previously saved signups are safely retained in SQLite.
                 await message.clear_reactions()
-                self.store.mark_reactions_cleared(thread_id)
-                for emoji in emojis:
-                    await message.add_reaction(emoji)
+                if preference_message is not None:
+                    await preference_message.clear_reactions()
                 new_ids = {str(i): str(e.id) for i, e in enumerate(emojis)}
                 self.store.reopen(thread_id, deadline, new_ids)
                 just_reopened = True
-            else:
-                # Retry path for a partially restored reopen operation.
+                # The fetched reaction cache is stale after clear_reactions().
                 for emoji in emojis:
-                    if not any(getattr(r.emoji, 'id', None) == emoji.id for r in message.reactions):
+                    await message.add_reaction(emoji)
+                if preference_message is not None:
+                    for emoji in FOURF_RUN_EMOJIS.values():
+                        await preference_message.add_reaction(emoji)
+            else:
+                # Retry path: don't clear any newly collected reactions.
+                for emoji in emojis:
+                    if not any(getattr(r.emoji, 'id', None) == emoji.id and r.me for r in message.reactions):
                         await message.add_reaction(emoji)
+                if preference_message is not None:
+                    await self.seed_run_reactions(preference_message)
                 if extra_minutes is not None or not AUTO_CLOSE:
                     self.store.extend_reopened_deadline(thread_id, deadline)
                 just_reopened = False
 
-            # Replace only the bot-owned starter text. The thread itself stays
-            # open and is not recreated. Also update any extended deadline.
-            # Keep a role mention only if the original starter already contained it.
-            # Editing/reopening must never re-notify the role or add it retroactively.
-            original_role_id = existing_message_role_id(message.content)
-            body = (starter_content(date.fromisoformat(rec['week_start']), deadline,
-                                    rec['raid_type'], role_id=original_role_id) + REOPEN_NOTE)
+            # Keep the announcement exactly as posted (in particular, Glenn's
+            # old run count and memo). An edit must never notify the role again.
+            body = reopened_starter_content(message.content, deadline)
             if message.content != body:
                 await message.edit(content=body, allowed_mentions=discord.AllowedMentions.none())
+            if preference_message is not None:
+                body = FOURF_PREFERENCE_CONTENT + PREFERENCE_REOPEN_NOTE
+                if preference_message.content != body:
+                    await preference_message.edit(content=body, allowed_mentions=discord.AllowedMentions.none())
             return self.store.by_thread(thread_id), just_reopened
 
     @tasks.loop(seconds=30)
@@ -604,6 +695,31 @@ async def emojis(interaction: discord.Interaction):
     except Exception as exc:
         text = f'이모지 확인 실패: {exc}'
     await interaction.followup.send(text, ephemeral=True)
+
+
+@party.command(name='글렌설정', description='앞으로 생성할 글렌 모집의 릴 횟수와 메모를 확인하거나 변경합니다.')
+@app_commands.rename(run_count='횟수', memo='메모', clear_memo='메모초기화')
+@app_commands.describe(run_count='글렌 주간 진행 횟수. 기본 5릴, 생략하면 기존 설정 유지.',
+                       memo='추가 입장권 획득처 또는 공지. 생략하면 기존 메모 유지.',
+                       clear_memo='기존 메모를 삭제하려면 참(True)을 선택해 주세요.')
+async def glenn_settings(interaction: discord.Interaction, run_count: int | None = None,
+                         memo: str | None = None, clear_memo: bool = False):
+    if not await require_organizer(interaction):
+        return
+    try:
+        changed = run_count is not None or memo is not None or clear_memo
+        if changed:
+            count, text = bot.store.update_glenn_settings(run_count=run_count, memo=memo, clear_memo=clear_memo)
+        else:
+            count, text = bot.store.glenn_settings()
+        status = '설정을 저장했습니다.' if changed else '현재 설정입니다.'
+        await interaction.response.send_message(
+            f'**글렌 모집 설정** — {status}\n횟수: {count}릴\n메모: {text or "없음"}\n'
+            '이 설정은 다음에 생성하는 글렌 모집부터 적용됩니다.',
+            ephemeral=True, allowed_mentions=discord.AllowedMentions.none())
+    except ValueError as exc:
+        await interaction.response.send_message(str(exc), ephemeral=True,
+                                                allowed_mentions=discord.AllowedMentions.none())
 
 
 @party.command(name='생성', description='선택한 던전의 다음 주 파티 모집 스레드를 생성합니다.')
@@ -715,9 +831,11 @@ async def report(interaction: discord.Interaction):
         if rec['status'] == 'closed':
             roster = await bot.resolve_roster_names(
                 interaction.guild, bot.store.final_roster(rec['thread_id']))
+            preferences = await bot.saved_run_preferences(interaction.guild, rec)
         else:
             roster = await bot.live_roster(rec)
-        await interaction.followup.send(embed=bot.report_embed(rec, roster), ephemeral=True)
+            preferences = await bot.live_run_preferences(rec)
+        await interaction.followup.send(embed=bot.report_embed(rec, roster, preferences), ephemeral=True)
     except Exception as exc:
         log.exception('Report failed')
         await interaction.followup.send(f'명단 조회 실패: {exc}', ephemeral=True)
@@ -762,7 +880,8 @@ async def close(interaction: discord.Interaction):
         rec = await bot.finish(rec)
         roster = await bot.resolve_roster_names(
             interaction.guild, bot.store.final_roster(rec['thread_id']))
-        await interaction.followup.send(embed=bot.report_embed(rec, roster), ephemeral=True)
+        preferences = await bot.saved_run_preferences(interaction.guild, rec)
+        await interaction.followup.send(embed=bot.report_embed(rec, roster, preferences), ephemeral=True)
     except Exception as exc:
         log.exception('Close failed')
         await interaction.followup.send(f'마감 처리 실패: {exc}. 재시도할 수 있습니다.', ephemeral=True)
