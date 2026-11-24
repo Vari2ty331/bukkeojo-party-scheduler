@@ -20,6 +20,7 @@ from core.calendar import (ENGLISH_KEYS, KOREAN_WEEKDAYS, KST, RAID_TYPES, raid_
                            is_starter_message, recruitment_week_start, due_openings, opening_for_week, local_dt,
                            starter_content, title, week_days)
 from core.storage import Storage, merge_rosters
+from core.calendar_image import render_calendar_png
 
 ROOT = Path(__file__).resolve().parent
 load_dotenv(ROOT / '.env')
@@ -204,6 +205,12 @@ class RaidBot(commands.Bot):
             if not isinstance(parent, discord.TextChannel):
                 raise RuntimeError('설정한 채널은 일반 텍스트 채널이어야 합니다.')
             mention_role = self.ping_target_for(parent, raid_type) if ROLE_MENTIONS_ENABLED else None
+            me = parent.guild.me
+            if me is not None and not parent.permissions_for(me).attach_files:
+                raise RuntimeError('모집 채널에서 봇에게 파일 첨부 권한을 부여해 주세요.')
+            # Generate before reserving or creating a new thread. A missing font
+            # or rendering failure cannot leave an empty recruitment behind.
+            calendar_png = await asyncio.to_thread(render_calendar_png, start)
 
             claimed = False
             if missing_thread_id is not None:
@@ -270,8 +277,18 @@ class RaidBot(commands.Bot):
                 allow_this_role = (discord.AllowedMentions(
                     everyone=False, users=False, roles=[mention_role], replied_user=False)
                     if mention_role else discord.AllowedMentions.none())
-                message = (previous[0] if previous else
-                           await thread.send(expected_message, allowed_mentions=allow_this_role))
+                if previous:
+                    # Reuse an already-sent starter after a crash; never send
+                    # a second notification or a second recruitment message.
+                    message = previous[0]
+                else:
+                    # The PNG and text share the same message ID. All signup
+                    # reactions, reports and close/reopen operations stay there.
+                    attachment = discord.File(
+                        calendar_png, filename='party-calendar.png',
+                        description=f'{start:%m/%d} ~ {start + timedelta(days=6):%m/%d} 파티 모집 달력')
+                    message = await thread.send(
+                        expected_message, file=attachment, allowed_mentions=allow_this_role)
                 self.store.record_recruitment_message(start, raid_type, message.id)
 
             # The database identity is now durable; both the manual command and
