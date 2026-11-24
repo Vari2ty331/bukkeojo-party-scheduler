@@ -18,7 +18,7 @@ from dotenv import load_dotenv
 
 from core.calendar import (ENGLISH_KEYS, KOREAN_WEEKDAYS, KST, RAID_TYPES, raid_label,
                            is_starter_message, recruitment_week_start, due_openings, opening_for_week, local_dt,
-                           starter_content, title, week_days)
+                           starter_content, title, legacy_thread_title, week_days)
 from core.storage import Storage, merge_rosters
 from core.calendar_image import render_calendar_png
 
@@ -138,15 +138,35 @@ class RaidBot(commands.Bot):
         Never adopt a thread owned by a person or another application.
         '''
         expected = title(start, raid_type)
+        previous_title = legacy_thread_title(start, raid_type)
+        reservation = self.store.creation_reservation(start, raid_type)
+        if reservation is None:
+            raise RuntimeError('생성 예약을 찾을 수 없습니다. 운영진 확인이 필요합니다.')
+        reserved_at = datetime.fromisoformat(reservation['created_at'])
+        # Discord snowflake timestamps have millisecond precision. Never adopt
+        # an older same-named thread, including one from a previous year.
+        reserved_at = reserved_at.replace(microsecond=reserved_at.microsecond // 1000 * 1000)
+        other_type = '4f' if raid_type == 'glenn' else 'glenn'
+        other_job = self.store.creation_reservation(start, other_type)
+        ambiguous_parent = (other_job is not None and not other_job['thread_id']
+                            and int(other_job['parent_channel_id']) == parent.id)
         candidates = []
+
+        def consider(thread):
+            if (thread.parent_id != parent.id or thread.owner_id != self.user.id
+                    or thread.name not in (expected, previous_title)
+                    or thread.created_at is None or thread.created_at < reserved_at
+                    or self.store.thread_is_recorded(thread.id)
+                    or any(x.id == thread.id for x in candidates)):
+                return
+            if thread.name == expected and ambiguous_parent:
+                raise RuntimeError('같은 채널에 두 던전의 미완료 생성 예약이 있습니다. 운영진 확인이 필요합니다.')
+            candidates.append(thread)
+
         for thread in await parent.guild.active_threads():
-            if (thread.parent_id == parent.id and thread.name == expected
-                    and thread.owner_id == self.user.id):
-                candidates.append(thread)
+            consider(thread)
         async for thread in parent.archived_threads(limit=archive_limit):
-            if (thread.name == expected and thread.owner_id == self.user.id
-                    and thread.id not in {x.id for x in candidates}):
-                candidates.append(thread)
+            consider(thread)
         if len(candidates) > 1:
             raise RuntimeError('여러 개의 동일한 봇 스레드가 발견되었습니다. 직접 확인해 주세요.')
         return candidates[0] if candidates else None
@@ -378,6 +398,26 @@ class RaidBot(commands.Bot):
                 log.info('Organizer deleted recruitment %s %s (thread %s)', raid_type, start, thread_id)
             return deleted
 
+    async def resolve_roster_names(self, guild, roster):
+        """Resolve current server nicknames once per user, preserving IDs and signups."""
+        names = {}
+        result = {i: [] for i in range(7)}
+        for i in range(7):
+            for uid, fallback in roster.get(i, []):
+                uid = str(uid)
+                if uid not in names:
+                    member = guild.get_member(int(uid))
+                    if member is None:
+                        try:
+                            member = await guild.fetch_member(int(uid))
+                        except discord.HTTPException:
+                            # A departed member or failed lookup must not remove a signup.
+                            member = None
+                    names[uid] = member.display_name if member is not None else None
+                result[i].append((uid, names[uid] if names[uid] is not None else fallback))
+            result[i].sort(key=lambda entry: (entry[1].casefold(), entry[0]))
+        return result
+
     async def live_roster(self, rec):
         channel = await self.fetch_channel(int(rec['thread_id']))
         message = await channel.fetch_message(int(rec['message_id']))
@@ -391,15 +431,10 @@ class RaidBot(commands.Bot):
                 continue
             async for user in reaction.users(limit=None):
                 if not user.bot:
-                    name = user.display_name
-                    if isinstance(user, discord.Member):
-                        name = user.display_name
-                    roster[index].append((str(user.id), name))
-        for users in roster.values():
-            users.sort(key=lambda entry: entry[1].casefold())
+                    roster[index].append((str(user.id), user.display_name))
         if rec['reopened_with_snapshot']:
-            return merge_rosters(self.store.final_roster(rec['thread_id']), roster)
-        return roster
+            roster = merge_rosters(self.store.final_roster(rec['thread_id']), roster)
+        return await self.resolve_roster_names(channel.guild, roster)
 
     def report_embed(self, rec, roster):
         start = date.fromisoformat(rec['week_start'])
@@ -677,7 +712,11 @@ async def report(interaction: discord.Interaction):
         return
     await interaction.response.defer(ephemeral=True, thinking=True)
     try:
-        roster = bot.store.final_roster(rec['thread_id']) if rec['status'] == 'closed' else await bot.live_roster(rec)
+        if rec['status'] == 'closed':
+            roster = await bot.resolve_roster_names(
+                interaction.guild, bot.store.final_roster(rec['thread_id']))
+        else:
+            roster = await bot.live_roster(rec)
         await interaction.followup.send(embed=bot.report_embed(rec, roster), ephemeral=True)
     except Exception as exc:
         log.exception('Report failed')
@@ -721,7 +760,8 @@ async def close(interaction: discord.Interaction):
     await interaction.response.defer(ephemeral=True, thinking=True)
     try:
         rec = await bot.finish(rec)
-        roster = bot.store.final_roster(rec['thread_id'])
+        roster = await bot.resolve_roster_names(
+            interaction.guild, bot.store.final_roster(rec['thread_id']))
         await interaction.followup.send(embed=bot.report_embed(rec, roster), ephemeral=True)
     except Exception as exc:
         log.exception('Close failed')

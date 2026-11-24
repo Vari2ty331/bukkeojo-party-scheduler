@@ -51,7 +51,12 @@ def week_days(thursday: date):
 
 def title(thursday: date, raid_type: str = "legacy") -> str:
     final = thursday + timedelta(days=6)
-    return f"{thursday:%m.%d} ~ {final:%m.%d} {raid_label(raid_type)} 모집"
+    return f"{thursday:%m.%d} ~ {final:%m.%d}"
+
+
+def legacy_thread_title(thursday: date, raid_type: str) -> str:
+    """Previous title, kept for recovery of interrupted creations."""
+    return f"{title(thursday, raid_type)} {raid_label(raid_type)} 모집"
 
 
 def starter_content(thursday: date, deadline: datetime | None, raid_type: str = "legacy",
@@ -62,6 +67,7 @@ def starter_content(thursday: date, deadline: datetime | None, raid_type: str = 
         role_mention + f"**{raid_label(raid_type)} 파티 모집 | {thursday:%m/%d} ~ {final:%m/%d}**"
         + "\n\n참여 가능한 날의 **요일 이모지**를 모두 눌러 주세요."
         + "\n시간 제한이 있다면 이 스레드에 댓글로 남겨 주세요."
+        + ("\n평일은 저녁, 주말/공휴일은 점심부터 출발" if raid_type == "glenn" else "")
         + (f"\n⏰ 신청 마감: **{deadline.astimezone(KST):%m/%d %H:%M} (한국 시간)**"
            if deadline is not None else "")
     )

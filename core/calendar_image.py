@@ -5,6 +5,7 @@ from io import BytesIO
 import os
 from pathlib import Path
 
+import holidays
 from PIL import Image, ImageDraw, ImageFont
 
 from core.calendar import week_days
@@ -35,8 +36,24 @@ def calendar_rows(start: date) -> list[list[date]]:
     return [[first + timedelta(days=r * 7 + c) for c in range(7)] for r in range(2)]
 
 
+def korean_public_holidays(rows):
+    """Include observed/substitute holidays for every year shown in the grid."""
+    years = {day.year for row in rows for day in row}
+    return holidays.country_holidays('KR', years=years, observed=True, language='ko')
+
+
+def date_color(day: date, active: bool, public_holidays) -> str:
+    """Public holiday red takes priority over Saturday blue, even outside selection."""
+    if day in public_holidays or day.weekday() == 6:
+        return '#f2a0a9' if active else '#a26b76'
+    if day.weekday() == 5:
+        return '#8abcf5' if active else '#6184ae'
+    return '#edf1f8' if active else '#7e899b'
+
+
 def render_calendar(start: date) -> Image.Image:
     rows = calendar_rows(start)
+    public_holidays = korean_public_holidays(rows)
     end = start + timedelta(days=6)
     first = rows[0][0]
     weeks = len(rows)
@@ -85,7 +102,7 @@ def render_calendar(start: date) -> Image.Image:
             day = rows[r][c]
             active = start <= day <= end
             x, y = x0+(c+.5)*cw, y0+r*rh
-            color = weekend.get(c, bright) if active else ({0:'#a26b76',6:'#6184ae'}.get(c, muted))
+            color = date_color(day, active, public_holidays)
             # Show the month change in its true calendar cell, not in a separate row.
             if day.day == 1 or day == first:
                 center((x,y+23), f'{day.month}월', font(17, active), accent if active else muted)

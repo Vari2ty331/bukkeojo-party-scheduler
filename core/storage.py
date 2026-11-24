@@ -130,6 +130,14 @@ class Storage:
             self.db.execute("DROP TABLE recruitments")
             self.db.execute("ALTER TABLE recruitments_v2 RENAME TO recruitments")
 
+    def thread_is_recorded(self, thread_id):
+        """Do not adopt any thread already assigned to a recruitment or reservation."""
+        return self.db.execute(
+            'SELECT 1 FROM recruitments WHERE thread_id=? '
+            'UNION ALL SELECT 1 FROM creation_reservations WHERE thread_id=? LIMIT 1',
+            (str(thread_id), str(thread_id)),
+        ).fetchone() is not None
+
     def creation_reservation(self, start, raid_type):
         return self.db.execute(
             'SELECT * FROM creation_reservations WHERE raid_type=? AND week_start=?',

@@ -6,7 +6,7 @@ from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
 from core.calendar import (KST, is_starter_message, next_thursday, raid_label,
-                           schedule_for_week, starter_content, title, week_days,
+                           schedule_for_week, starter_content, title, legacy_thread_title, week_days,
                            opening_for_week, due_openings, recruitment_week_start)
 from core.storage import Storage, merge_rosters
 
@@ -81,6 +81,12 @@ class CalendarTests(unittest.TestCase):
         self.assertNotIn('⏰', text)
         self.assertTrue(is_starter_message(text, START, '4f'))
 
+    def test_glenn_only_departure_note(self):
+        note = '평일은 저녁, 주말/공휴일은 점심부터 출발'
+        self.assertEqual(starter_content(START, None, 'glenn').count(note), 1)
+        self.assertNotIn(note, starter_content(START, None, '4f'))
+        self.assertTrue(is_starter_message(starter_content(START, None, 'glenn'), START, 'glenn'))
+
     def test_starter_mentions_only_configured_role_when_supplied(self):
         glenn = starter_content(START, DEADLINE, 'glenn', role_id=111222333)
         fourf = starter_content(START, DEADLINE, '4f', role_id=444555666)
@@ -127,8 +133,10 @@ class CalendarTests(unittest.TestCase):
         self.assertTrue(is_starter_message(old, START, 'glenn'))
 
     def test_dungeon_labels_are_distinct(self):
-        self.assertIn('글렌 베르나', title(START, 'glenn'))
-        self.assertIn('4관', title(START, '4f'))
+        self.assertEqual(title(START, 'glenn'), '11.26 ~ 12.02')
+        self.assertEqual(title(START, '4f'), '11.26 ~ 12.02')
+        self.assertEqual(legacy_thread_title(START, 'glenn'), '11.26 ~ 12.02 글렌 베르나 모집')
+        self.assertEqual(legacy_thread_title(START, '4f'), '11.26 ~ 12.02 4관 모집')
         self.assertIn('글렌 베르나', starter_content(START, DEADLINE, 'glenn'))
         self.assertIn('4관', starter_content(START, DEADLINE, '4f'))
         self.assertEqual(raid_label('legacy'), '기존 파티')

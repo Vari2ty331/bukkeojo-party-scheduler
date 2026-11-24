@@ -21,7 +21,7 @@ NanumGothic. On Windows it can use Malgun Gothic (맑은 고딕). No font files
 are included in the repository. The exact font appearance may differ.
 
 Make sure the bot has Attach Files (파일 첨부) in both recruitment channels.
-The update script will install Pillow into the existing virtual environment
+The update script will install Pillow and `holidays` into the existing virtual environment
 from `requirements.txt`. There are no new `.env` settings.
 
 ## Offline preview
@@ -43,6 +43,11 @@ The date must be the Thursday of the desired play week. This preview
 requires no Discord token or running bot; it never posts a message.
 
 ## Behavior
+
+- South Korean public holidays (including substitute days) are rendered in
+  red, overriding Saturday blue. Holiday data is computed locally for both
+  calendar years if the grid crosses New Year; no API or key is needed.
+  Newly declared holidays may require a `holidays` package update.
 
 - Existing recruitments are not changed or re-announced. Reopening or closing
   changes the message text without replacing its attachments.

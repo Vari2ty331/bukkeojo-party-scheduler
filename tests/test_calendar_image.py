@@ -5,7 +5,8 @@ from pathlib import Path
 
 from PIL import Image
 
-from core.calendar_image import calendar_rows, font_paths, render_calendar_png
+from core.calendar_image import (calendar_rows, font_paths, render_calendar_png,
+                                 korean_public_holidays, date_color)
 
 
 class PartialCalendarTests(unittest.TestCase):
@@ -26,6 +27,26 @@ class PartialCalendarTests(unittest.TestCase):
                 self.assertEqual(rows[1][3], start + timedelta(days=6))
                 dates = rows[0] + rows[1]
                 self.assertEqual(dates, [dates[0] + timedelta(days=i) for i in range(14)])
+
+    def test_public_holidays_and_year_boundary(self):
+        # Christmas, New Year, and the substitute day for Liberation Day 2026.
+        for start, holiday in ((date(2026, 12, 24), date(2026, 12, 25)),
+                               (date(2026, 12, 31), date(2027, 1, 1)),
+                               (date(2026, 8, 13), date(2026, 8, 17))):
+            with self.subTest(holiday=holiday):
+                public = korean_public_holidays(calendar_rows(start))
+                self.assertIn(holiday, public)
+                self.assertEqual(date_color(holiday, True, public), '#f2a0a9')
+                self.assertEqual(date_color(holiday, False, public), '#a26b76')
+
+    def test_public_holiday_color_overrides_saturday(self):
+        saturday = date(2026, 8, 15)
+        public = korean_public_holidays(calendar_rows(date(2026, 8, 13)))
+        self.assertIn(saturday, public)
+        self.assertEqual(date_color(saturday, True, public), '#f2a0a9')
+        self.assertEqual(date_color(date(2026, 8, 22), True, public), '#8abcf5')
+        self.assertEqual(date_color(date(2026, 8, 16), True, public), '#f2a0a9')
+        self.assertEqual(date_color(date(2026, 8, 18), True, public), '#edf1f8')
 
     def test_reject_non_thursday(self):
         with self.assertRaises(ValueError):
