@@ -1,0 +1,30 @@
+# Private configuration
+.env
+.env.*
+!.env.example
+
+# Python virtual environments
+.venv*/
+venv/
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+
+# Database and runtime data
+data/
+*.sqlite3
+*.sqlite3-wal
+*.sqlite3-shm
+
+# Logs
+*.log
+
+# Local IDE settings
+.vscode/
+.idea/
+
+# OS-generated files
+Thumbs.db
+.DS_Store
