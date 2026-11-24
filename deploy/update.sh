@@ -29,9 +29,9 @@ if [[ -n "$(git status --porcelain --untracked-files=no)" ]]; then
   exit 1
 fi
 
-git fetch --quiet origin main
+git fetch --quiet origin master
 CURRENT="$(git rev-parse HEAD)"
-LATEST="$(git rev-parse refs/remotes/origin/main)"
+LATEST="$(git rev-parse refs/remotes/origin/master)"
 if [[ "$CURRENT" == "$LATEST" ]]; then
   echo "No update (commit $CURRENT)."
   exit 0

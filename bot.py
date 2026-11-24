@@ -37,6 +37,7 @@ FOURF_TEXT_CHANNEL_ID = env_int('FOURF_TEXT_CHANNEL_ID')
 GLENN_PARTICIPANT_ROLE_ID = env_int('GLENN_PARTICIPANT_ROLE_ID')
 FOURF_PARTICIPANT_ROLE_ID = env_int('FOURF_PARTICIPANT_ROLE_ID')
 ORGANIZER_ROLE_ID = env_int('ORGANIZER_ROLE_ID')
+ROLE_MENTIONS_ENABLED = os.getenv('ROLE_MENTIONS_ENABLED', 'false').strip().lower() == 'true'
 AUTO_CREATE = os.getenv('AUTO_CREATE_ENABLED', 'false').lower() == 'true'
 AUTO_CLOSE = os.getenv('AUTO_CLOSE_ENABLED', 'false').lower() == 'true'
 OPEN_DAYS_BEFORE = env_int('OPEN_DAYS_BEFORE', 1)
@@ -45,9 +46,10 @@ OPEN_TIME = os.getenv('OPEN_TIME', '18:00')
 CLOSE_TIME = os.getenv('CLOSE_TIME', '23:00')
 DB_PATH = ROOT / os.getenv('DATABASE_PATH', 'data/recruitments.sqlite3')
 
-if not all((GUILD_ID, GLENN_TEXT_CHANNEL_ID, FOURF_TEXT_CHANNEL_ID,
-            GLENN_PARTICIPANT_ROLE_ID, FOURF_PARTICIPANT_ROLE_ID)):
-    raise SystemExit('.env에 GUILD_ID, 두 던전의 채널 ID와 참여자 역할 ID를 입력해 주세요.')
+if not all((GUILD_ID, GLENN_TEXT_CHANNEL_ID, FOURF_TEXT_CHANNEL_ID)):
+    raise SystemExit('.env에 GUILD_ID와 두 던전의 채널 ID를 입력해 주세요.')
+if ROLE_MENTIONS_ENABLED and not all((GLENN_PARTICIPANT_ROLE_ID, FOURF_PARTICIPANT_ROLE_ID)):
+    raise SystemExit('역할 멘션을 사용하려면 .env에 두 던전의 참여자 역할 ID를 입력해 주세요.')
 
 party = app_commands.Group(name='파티', description='주간 파티 모집을 관리합니다.')
 REOPEN_NOTE = '\n\n🔓 재모집 중 — 기존 신청자는 다시 누르지 않아도 됩니다.'
@@ -103,6 +105,7 @@ class RaidBot(commands.Bot):
     async def on_ready(self):
         log.info('Ready as %s (%s). Glenn channel: %s; 4F channel: %s',
                  self.user, self.user.id, GLENN_TEXT_CHANNEL_ID, FOURF_TEXT_CHANNEL_ID)
+        log.info('Participant role mentions enabled: %s', ROLE_MENTIONS_ENABLED)
 
     async def get_emojis(self):
         emoji_by_name = {e.name: e for e in await self.fetch_application_emojis()}
@@ -178,7 +181,7 @@ class RaidBot(commands.Bot):
             parent = await self.fetch_channel(parent_id)
             if not isinstance(parent, discord.TextChannel):
                 raise RuntimeError('설정한 채널은 일반 텍스트 채널이어야 합니다.')
-            mention_role = self.ping_target_for(parent, raid_type)
+            mention_role = self.ping_target_for(parent, raid_type) if ROLE_MENTIONS_ENABLED else None
 
             claimed = False
             if job is None:
@@ -219,7 +222,8 @@ class RaidBot(commands.Bot):
                 message = await thread.fetch_message(int(job['message_id']))
             else:
                 # Recover from the narrow crash window after sending the starter.
-                expected_message = starter_content(start, deadline, raid_type, role_id=mention_role.id)
+                expected_message = starter_content(
+                    start, deadline, raid_type, role_id=mention_role.id if mention_role else None)
                 previous = []
                 async for candidate in thread.history(limit=100, oldest_first=True):
                     if (candidate.author.id == self.user.id
@@ -227,10 +231,11 @@ class RaidBot(commands.Bot):
                         previous.append(candidate)
                 if len(previous) > 1:
                     raise RuntimeError('여러 개의 모집 게시물이 발견되었습니다. 직접 확인해 주세요.')
-                # Only allow this specific participant role to notify users.
-                # bot.allowed_mentions is globally set to none; this is a one-message override.
-                allow_this_role = discord.AllowedMentions(
+                # Testing mode suppresses every mention. Production allows only
+                # the configured dungeon role, never everyone or other users.
+                allow_this_role = (discord.AllowedMentions(
                     everyone=False, users=False, roles=[mention_role], replied_user=False)
+                    if mention_role else discord.AllowedMentions.none())
                 message = (previous[0] if previous else
                            await thread.send(expected_message, allowed_mentions=allow_this_role))
                 self.store.record_recruitment_message(start, raid_type, message.id)
@@ -413,7 +418,9 @@ bot = RaidBot()
 
 @party.command(name='상태', description='파티 모집 봇의 작동 상태를 확인합니다.')
 async def ping(interaction: discord.Interaction):
-    await interaction.response.send_message('✅ 파티 모집 봇이 정상 작동 중입니다.', ephemeral=True)
+    mention_status = '켜짐' if ROLE_MENTIONS_ENABLED else '꺼짐'
+    await interaction.response.send_message(
+        f'✅ 파티 모집 봇이 정상 작동 중입니다.\n참여자 역할 멘션: {mention_status}', ephemeral=True)
 
 
 @party.command(name='이모지', description='요일별 모집 이모지가 준비되었는지 확인합니다.')

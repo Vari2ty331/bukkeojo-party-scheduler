@@ -18,7 +18,7 @@ participant role mention at the very top of the first calendar/signup message
 - Repeating `/파티 생성`, reopening recruitment, closing, or updating the
   message **does not send another role notification**.
 - This works for your existing **ordinary text-channel threads**.
-- Set both role IDs in `.env`, including in your test server.
+- Set `ROLE_MENTIONS_ENABLED=false` in `.env` while testing (default). No participant role is mentioned or validated. Set it to `true` and supply both role IDs when ready to notify members. Restart the bot after changing this setting. `/파티 상태` displays the current setting.
 - The role must be **Mentionable**, OR the bot must have the channel permission
   **Mention @everyone, @here, and All Roles**. The latter is broader than
   necessary, so making your two participant roles mentionable is usually safer.
@@ -52,6 +52,7 @@ participant role mention at the very top of the first calendar/signup message
    GUILD_ID=YOUR_GUILD_ID
    GLENN_TEXT_CHANNEL_ID=YOUR_GLENN_PARENT_TEXT_CHANNEL_ID
    FOURF_TEXT_CHANNEL_ID=YOUR_4F_PARENT_TEXT_CHANNEL_ID
+   ROLE_MENTIONS_ENABLED=false
    GLENN_PARTICIPANT_ROLE_ID=YOUR_GLENN_PARTICIPANTS_ROLE_ID
    FOURF_PARTICIPANT_ROLE_ID=YOUR_4F_PARTICIPANTS_ROLE_ID
    ORGANIZER_ROLE_ID=YOUR_ORGANIZER_ROLE_ID

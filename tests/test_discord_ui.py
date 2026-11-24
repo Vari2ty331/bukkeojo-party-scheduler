@@ -18,6 +18,13 @@ class CommandAppearanceTests(unittest.TestCase):
         self.assertNotIn("name='raid'", self.source)
         self.assertIn('self.tree.add_command(party', self.source)
 
+    def test_role_mentions_default_to_off(self):
+        self.assertIn("os.getenv('ROLE_MENTIONS_ENABLED', 'false')", self.source)
+        self.assertIn('if ROLE_MENTIONS_ENABLED else None', self.source)
+        self.assertIn('role_id=mention_role.id if mention_role else None', self.source)
+        self.assertIn('if mention_role else discord.AllowedMentions.none()', self.source)
+        self.assertIn('if ROLE_MENTIONS_ENABLED and not all', self.source)
+
     def test_korean_subcommands(self):
         expected = {'상태', '이모지', '생성', '명단', '마감', '재개'}
         actual = set()
