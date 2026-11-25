@@ -6,10 +6,11 @@ Existing single-raid records are migrated to type `legacy` and preserved.
 """
 import json
 import sqlite3
-from datetime import timedelta
+from datetime import datetime, timedelta
 from pathlib import Path
 
-from core.calendar import DEFAULT_GLENN_RUNS, MAX_GLENN_MEMO_LENGTH, FOURF_RUN_EMOJIS
+from core.calendar import (DEFAULT_GLENN_RUNS, MAX_GLENN_MEMO_LENGTH, FOURF_RUN_EMOJIS,
+                           RAID_TYPES, opening_for_week)
 
 
 SCHEMA = """
@@ -99,7 +100,7 @@ class Storage:
               created_at TEXT NOT NULL,
               PRIMARY KEY (raid_type, week_start)
             );
-            -- A deliberate deletion suppresses only this week's automatic creation.
+            -- Deletion timestamps: only deletions at/after opening suppress auto-creation.
             CREATE TABLE IF NOT EXISTS cancelled_weeks (
               raid_type TEXT NOT NULL,
               week_start TEXT NOT NULL,
@@ -270,17 +271,38 @@ class Storage:
             return True
 
     def is_cancelled(self, start, raid_type):
-        return self.db.execute(
-            'SELECT 1 FROM cancelled_weeks WHERE raid_type=? AND week_start=?',
+        """Whether a deletion blocks the scheduled automatic creation.
+
+        A test recruitment deleted before its dungeon's opening must not
+        cancel that opening. Existing deletion timestamps from older versions
+        are evaluated by the same rule; no database migration is required.
+        A deletion at or after opening still prevents repeated automatic posts.
+        """
+        row = self.db.execute(
+            'SELECT cancelled_at FROM cancelled_weeks WHERE raid_type=? AND week_start=?',
             (raid_type, start.isoformat())
-        ).fetchone() is not None
+        ).fetchone()
+        if row is None:
+            return False
+        if raid_type not in RAID_TYPES:
+            return True  # Legacy recruitments have no automatic opening.
+        # Older versions also saved timezone-aware ISO timestamps. If a
+        # manually edited/corrupt record has no valid timestamp, fail closed.
+        try:
+            deleted_at = datetime.fromisoformat(row['cancelled_at'])
+            if deleted_at.tzinfo is None or deleted_at.utcoffset() is None:
+                return True
+        except (ValueError, TypeError):
+            return True
+        return deleted_at >= opening_for_week(start, raid_type)
 
     def delete_recruitment(self, start, raid_type, now, *, expected_record, expected_reservation):
         """Remove just one confirmed recruitment and its roster/reservation atomically.
 
         Caller must have deleted the corresponding Discord thread (or confirmed
-        it is missing). An explicit cancellation prevents the timer from
-        immediately recreating it. New manual creation can clear that marker.
+        it is missing). Record the deletion time: before opening it does not
+        block the scheduled post, at/after opening it prevents repeated posts.
+        A successful new creation clears that marker.
         """
         if raid_type not in ('glenn', '4f', 'legacy'):
             raise ValueError('Unknown dungeon')
@@ -376,7 +398,7 @@ class Storage:
                   (start + timedelta(days=6)).isoformat(), str(message_id),
                   (deadline_at.isoformat() if deadline_at is not None else ""), json.dumps(emoji_ids),
                   str(preference_message_id) if preference_message_id is not None else None))
-            # Only a successful creation releases the cancellation marker.
+            # A successful creation releases any prior deletion marker.
             self.db.execute('DELETE FROM cancelled_weeks WHERE raid_type=? AND week_start=?',
                             (raid_type, start.isoformat()))
 

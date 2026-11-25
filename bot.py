@@ -838,7 +838,8 @@ async def delete(interaction: discord.Interaction, confirmed: bool = False,
     if not confirmed:
         await interaction.response.send_message(
             f'**{label}**\n⚠️ 모집 스레드(있는 경우), 모든 신청 명단 및 해당 생성 기록을 영구 삭제합니다. '
-            '복구할 수 없으며 자동 재생성되지 않습니다.\n'
+            '기존 신청 기록은 복구할 수 없습니다. 자동 생성 예정 시각 전 삭제하면 예정대로 자동 생성되며, '
+            '예정 시각 이후에는 자동 재생성되지 않습니다.\n'
             '삭제하려면 같은 명령어에서 확인을 참(True)으로 선택해 주세요.', ephemeral=True)
         return
     await interaction.response.defer(ephemeral=True, thinking=True)

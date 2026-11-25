@@ -375,6 +375,67 @@ class StorageTests(unittest.TestCase):
             self.assertEqual(db.final_roster('400')[0], [])
             db.db.close()
 
+    def test_preopening_deletions_do_not_cancel_scheduled_creation(self):
+        # Applies independently to both dungeons, including the old deletion
+        # markers already saved in production, and survives a restart.
+        for raid_type in ('glenn', '4f'):
+            with self.subTest(raid_type=raid_type), tempfile.TemporaryDirectory() as tmp:
+                path = Path(tmp) / 'test.sqlite3'
+                opening = opening_for_week(START, raid_type)
+                before = opening - timedelta(seconds=1)
+                db = Storage(path)
+                db.insert('100', START, '101', None, EMOJIS, raid_type)
+                self.assertFalse(db.reserve_creation(START, raid_type, '500', opening))
+                self.assertTrue(db.delete_recruitment(
+                    START, raid_type, before, expected_record=db.by_thread('100'),
+                    expected_reservation=None))
+                self.assertIsNone(db.by_week(START, raid_type))
+                self.assertFalse(db.is_cancelled(START, raid_type))
+                db.db.close()
+                db = Storage(path)
+                self.assertFalse(db.is_cancelled(START, raid_type))
+                self.assertIn((START, raid_type), due_openings(opening))
+                self.assertTrue(db.reserve_creation(START, raid_type, '500', opening))
+                db.record_created_thread(START, raid_type, '200')
+                db.record_recruitment_message(START, raid_type, '201')
+                db.insert('200', START, '201', None, EMOJIS, raid_type)
+                db.release_creation_reservation(START, raid_type)
+                self.assertFalse(db.reserve_creation(START, raid_type, '500', opening))
+                db.db.close()
+
+    def test_deletion_at_or_after_opening_blocks_only_that_dungeon_and_week(self):
+        for raid_type in ('glenn', '4f'):
+            other = '4f' if raid_type == 'glenn' else 'glenn'
+            for offset in (0, 60):
+                with self.subTest(raid_type=raid_type, seconds=offset), tempfile.TemporaryDirectory() as tmp:
+                    db = Storage(Path(tmp) / 'test.sqlite3')
+                    opening = opening_for_week(START, raid_type)
+                    deleted_at = opening + timedelta(seconds=offset)
+                    db.insert('100', START, '101', None, EMOJIS, raid_type)
+                    self.assertTrue(db.delete_recruitment(
+                        START, raid_type, deleted_at, expected_record=db.by_thread('100'),
+                        expected_reservation=None))
+                    self.assertTrue(db.is_cancelled(START, raid_type))
+                    self.assertFalse(db.reserve_creation(START, raid_type, '500', deleted_at))
+                    self.assertFalse(db.is_cancelled(START, other))
+                    self.assertFalse(db.is_cancelled(START + timedelta(days=7), raid_type))
+                    self.assertTrue(db.reserve_creation(START, raid_type, '500', deleted_at,
+                                                        allow_cancelled=True))
+                    db.db.close()
+
+    def test_old_deletion_markers_use_dungeon_opening_in_kst(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db = Storage(Path(tmp) / 'test.sqlite3')
+            # Tuesday at noon KST: after the 4F opening, before Glenn's.
+            same_time = datetime(2026, 11, 24, 3, tzinfo=timezone.utc)
+            with db.db:
+                db.db.executemany('INSERT INTO cancelled_weeks VALUES (?, ?, ?)',
+                                  [(kind, START.isoformat(), same_time.isoformat())
+                                   for kind in ('glenn', '4f')])
+            self.assertFalse(db.is_cancelled(START, 'glenn'))
+            self.assertTrue(db.is_cancelled(START, '4f'))
+            db.db.close()
+
     def test_explicit_delete_cleans_matching_creation_reservation(self):
         with tempfile.TemporaryDirectory() as tmp:
             db = Storage(Path(tmp) / 'test.sqlite3')

@@ -1,0 +1,166 @@
+diff --git a/bot.py b/bot.py
+index aa3c0fe..3b3c229 100644
+--- a/bot.py
++++ b/bot.py
+@@ -838,7 +838,8 @@ async def delete(interaction: discord.Interaction, confirmed: bool = False,
+     if not confirmed:
+         await interaction.response.send_message(
+             f'**{label}**\n⚠️ 모집 스레드(있는 경우), 모든 신청 명단 및 해당 생성 기록을 영구 삭제합니다. '
+-            '복구할 수 없으며 자동 재생성되지 않습니다.\n'
++            '기존 신청 기록은 복구할 수 없습니다. 자동 생성 예정 시각 전 삭제하면 예정대로 자동 생성되며, '
++            '예정 시각 이후에는 자동 재생성되지 않습니다.\n'
+             '삭제하려면 같은 명령어에서 확인을 참(True)으로 선택해 주세요.', ephemeral=True)
+         return
+     await interaction.response.defer(ephemeral=True, thinking=True)
+diff --git a/core/storage.py b/core/storage.py
+index 8b7adb5..ba1260a 100644
+--- a/core/storage.py
++++ b/core/storage.py
+@@ -6,10 +6,11 @@ Existing single-raid records are migrated to type `legacy` and preserved.
+ """
+ import json
+ import sqlite3
+-from datetime import timedelta
++from datetime import datetime, timedelta
+ from pathlib import Path
+ 
+-from core.calendar import DEFAULT_GLENN_RUNS, MAX_GLENN_MEMO_LENGTH, FOURF_RUN_EMOJIS
++from core.calendar import (DEFAULT_GLENN_RUNS, MAX_GLENN_MEMO_LENGTH, FOURF_RUN_EMOJIS,
++                           RAID_TYPES, opening_for_week)
+ 
+ 
+ SCHEMA = """
+@@ -99,7 +100,7 @@ class Storage:
+               created_at TEXT NOT NULL,
+               PRIMARY KEY (raid_type, week_start)
+             );
+-            -- A deliberate deletion suppresses only this week's automatic creation.
++            -- Deletion timestamps: only deletions at/after opening suppress auto-creation.
+             CREATE TABLE IF NOT EXISTS cancelled_weeks (
+               raid_type TEXT NOT NULL,
+               week_start TEXT NOT NULL,
+@@ -270,17 +271,38 @@ class Storage:
+             return True
+ 
+     def is_cancelled(self, start, raid_type):
+-        return self.db.execute(
+-            'SELECT 1 FROM cancelled_weeks WHERE raid_type=? AND week_start=?',
++        """Whether a deletion blocks the scheduled automatic creation.
++
++        A test recruitment deleted before its dungeon's opening must not
++        cancel that opening. Existing deletion timestamps from older versions
++        are evaluated by the same rule; no database migration is required.
++        A deletion at or after opening still prevents repeated automatic posts.
++        """
++        row = self.db.execute(
++            'SELECT cancelled_at FROM cancelled_weeks WHERE raid_type=? AND week_start=?',
+             (raid_type, start.isoformat())
+-        ).fetchone() is not None
++        ).fetchone()
++        if row is None:
++            return False
++        if raid_type not in RAID_TYPES:
++            return True  # Legacy recruitments have no automatic opening.
++        # Older versions also saved timezone-aware ISO timestamps. If a
++        # manually edited/corrupt record has no valid timestamp, fail closed.
++        try:
++            deleted_at = datetime.fromisoformat(row['cancelled_at'])
++            if deleted_at.tzinfo is None or deleted_at.utcoffset() is None:
++                return True
++        except (ValueError, TypeError):
++            return True
++        return deleted_at >= opening_for_week(start, raid_type)
+ 
+     def delete_recruitment(self, start, raid_type, now, *, expected_record, expected_reservation):
+         """Remove just one confirmed recruitment and its roster/reservation atomically.
+ 
+         Caller must have deleted the corresponding Discord thread (or confirmed
+-        it is missing). An explicit cancellation prevents the timer from
+-        immediately recreating it. New manual creation can clear that marker.
++        it is missing). Record the deletion time: before opening it does not
++        block the scheduled post, at/after opening it prevents repeated posts.
++        A successful new creation clears that marker.
+         """
+         if raid_type not in ('glenn', '4f', 'legacy'):
+             raise ValueError('Unknown dungeon')
+@@ -376,7 +398,7 @@ class Storage:
+                   (start + timedelta(days=6)).isoformat(), str(message_id),
+                   (deadline_at.isoformat() if deadline_at is not None else ""), json.dumps(emoji_ids),
+                   str(preference_message_id) if preference_message_id is not None else None))
+-            # Only a successful creation releases the cancellation marker.
++            # A successful creation releases any prior deletion marker.
+             self.db.execute('DELETE FROM cancelled_weeks WHERE raid_type=? AND week_start=?',
+                             (raid_type, start.isoformat()))
+ 
+diff --git a/tests/test_core.py b/tests/test_core.py
+index f0247cb..a46cf5d 100644
+--- a/tests/test_core.py
++++ b/tests/test_core.py
+@@ -375,6 +375,67 @@ class StorageTests(unittest.TestCase):
+             self.assertEqual(db.final_roster('400')[0], [])
+             db.db.close()
+ 
++    def test_preopening_deletions_do_not_cancel_scheduled_creation(self):
++        # Applies independently to both dungeons, including the old deletion
++        # markers already saved in production, and survives a restart.
++        for raid_type in ('glenn', '4f'):
++            with self.subTest(raid_type=raid_type), tempfile.TemporaryDirectory() as tmp:
++                path = Path(tmp) / 'test.sqlite3'
++                opening = opening_for_week(START, raid_type)
++                before = opening - timedelta(seconds=1)
++                db = Storage(path)
++                db.insert('100', START, '101', None, EMOJIS, raid_type)
++                self.assertFalse(db.reserve_creation(START, raid_type, '500', opening))
++                self.assertTrue(db.delete_recruitment(
++                    START, raid_type, before, expected_record=db.by_thread('100'),
++                    expected_reservation=None))
++                self.assertIsNone(db.by_week(START, raid_type))
++                self.assertFalse(db.is_cancelled(START, raid_type))
++                db.db.close()
++                db = Storage(path)
++                self.assertFalse(db.is_cancelled(START, raid_type))
++                self.assertIn((START, raid_type), due_openings(opening))
++                self.assertTrue(db.reserve_creation(START, raid_type, '500', opening))
++                db.record_created_thread(START, raid_type, '200')
++                db.record_recruitment_message(START, raid_type, '201')
++                db.insert('200', START, '201', None, EMOJIS, raid_type)
++                db.release_creation_reservation(START, raid_type)
++                self.assertFalse(db.reserve_creation(START, raid_type, '500', opening))
++                db.db.close()
++
++    def test_deletion_at_or_after_opening_blocks_only_that_dungeon_and_week(self):
++        for raid_type in ('glenn', '4f'):
++            other = '4f' if raid_type == 'glenn' else 'glenn'
++            for offset in (0, 60):
++                with self.subTest(raid_type=raid_type, seconds=offset), tempfile.TemporaryDirectory() as tmp:
++                    db = Storage(Path(tmp) / 'test.sqlite3')
++                    opening = opening_for_week(START, raid_type)
++                    deleted_at = opening + timedelta(seconds=offset)
++                    db.insert('100', START, '101', None, EMOJIS, raid_type)
++                    self.assertTrue(db.delete_recruitment(
++                        START, raid_type, deleted_at, expected_record=db.by_thread('100'),
++                        expected_reservation=None))
++                    self.assertTrue(db.is_cancelled(START, raid_type))
++                    self.assertFalse(db.reserve_creation(START, raid_type, '500', deleted_at))
++                    self.assertFalse(db.is_cancelled(START, other))
++                    self.assertFalse(db.is_cancelled(START + timedelta(days=7), raid_type))
++                    self.assertTrue(db.reserve_creation(START, raid_type, '500', deleted_at,
++                                                        allow_cancelled=True))
++                    db.db.close()
++
++    def test_old_deletion_markers_use_dungeon_opening_in_kst(self):
++        with tempfile.TemporaryDirectory() as tmp:
++            db = Storage(Path(tmp) / 'test.sqlite3')
++            # Tuesday at noon KST: after the 4F opening, before Glenn's.
++            same_time = datetime(2026, 11, 24, 3, tzinfo=timezone.utc)
++            with db.db:
++                db.db.executemany('INSERT INTO cancelled_weeks VALUES (?, ?, ?)',
++                                  [(kind, START.isoformat(), same_time.isoformat())
++                                   for kind in ('glenn', '4f')])
++            self.assertFalse(db.is_cancelled(START, 'glenn'))
++            self.assertTrue(db.is_cancelled(START, '4f'))
++            db.db.close()
++
+     def test_explicit_delete_cleans_matching_creation_reservation(self):
+         with tempfile.TemporaryDirectory() as tmp:
+             db = Storage(Path(tmp) / 'test.sqlite3')
